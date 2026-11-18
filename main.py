@@ -21,10 +21,10 @@ cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
 # cam_pos options: "top-left", "mid-left", "top-right", "bottom-left", "bottom-right"
 STREAMERS = [
-    {"name": "KaiCenat", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
-    {"name": "xQc", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
-    {"name": "CaseOh", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "cam_pos": "mid-left"},
-    {"name": "IShowSpeed", "url": "https://www.youtube.com/@IShowSpeed/streams", "cam_pos": "top-left"},
+    {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
+    {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
+    {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "cam_pos": "mid-left"},
+    {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams", "cam_pos": "top-left"},
 ]
 
 GTA6_KEYWORDS = ("gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi", "grand theft auto 6")
@@ -61,7 +61,7 @@ def save_history(history):
 
 def collect_viral_candidates(streamers, history):
     """
-    Probes all streamers and collects their unposted clips/streams along with view counts,
+    Probes all streamers and collects unposted clips/streams with view counts,
     ranking by: (1) GTA 6 match, (2) not repeating the exact last streamer, (3) highest view count.
     """
     candidates = []
@@ -109,11 +109,9 @@ def collect_viral_candidates(streamers, history):
         except Exception as e:
             print(f"Parse warning for {streamer['name']}: {e}")
 
-    # Add slight randomness (+-15%) to view counts so similarly viral clips mix naturally
     for c in candidates:
         c["weighted_views"] = c["views"] * random.uniform(0.85, 1.15)
 
-    # Sort priority: GTA 6 first -> different streamer than last post -> highest viral views
     candidates.sort(
         key=lambda c: (c["is_gta6"], c["different_creator"], c["weighted_views"]),
         reverse=True
@@ -277,7 +275,7 @@ def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="fina
             "ffmpeg", "-y", "-i", trimmed,
             "-filter_complex", filter_complex,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "24",
             "-c:a", "aac", "-b:a", "128k",
             output_path
         ],
@@ -286,20 +284,25 @@ def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="fina
     return output_path, transcript
 
 
-def make_viral_caption(streamer_name, transcript, is_gta6=False):
+def make_viral_caption(streamer, transcript, is_gta6=False):
+    name = streamer["name"]
+    platform = streamer.get("platform", "Twitch")
     game_tag = "#gta6 " if is_gta6 else ""
-    fallback = f"{streamer_name}'s reaction is unreal 💀🔥 {game_tag}#gaming #{streamer_name.lower()} #twitch #shorts"
+    credit_line = f"Credit: @{name} on {platform}"
+    fallback = f"{name}'s reaction is unreal 💀🔥 {game_tag}#gaming #{name.lower()} #shorts\n\n{credit_line}"
+
     if not GEMINI_API_KEY or not transcript.strip():
         return fallback
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
-            f"Write a short, viral 1-sentence YouTube Shorts / TikTok caption (under 90 chars) for a gaming clip of {streamer_name}. "
+            f"Write a short, viral 1-sentence YouTube Shorts / TikTok hook caption (under 85 chars) for a gaming clip of {name}. "
             f"Transcript snippet: '{transcript[:250]}'. "
-            f"Include {game_tag}#gaming #shorts and #{streamer_name.lower()}. Return ONLY the caption text."
+            f"Include {game_tag}#gaming #shorts and #{name.lower()}. Return ONLY the caption text."
         )
         res = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
-        return res.text.strip()[:140] or fallback
+        hook = res.text.strip()[:120] or f"{name}'s reaction is unreal 💀🔥 {game_tag}#gaming #{name.lower()} #shorts"
+        return f"{hook}\n\n{credit_line}"
     except Exception:
         return fallback
 
@@ -342,8 +345,19 @@ def publish_to_all_platforms(public_video_url, caption):
         if service == "instagram":
             post_input["metadata"] = {"instagram": {"type": "reel", "shouldShareToFeed": True}}
         elif service == "youtube":
-            yt_title = caption.split("#")[0].strip()[:88] or "Insane Stream Reaction"
-            post_input["metadata"] = {"youtube": {"title": f"{yt_title} #shorts"[:100], "categoryId": "20"}}
+            first_line = caption.splitlines()[0]
+            yt_title = first_line.split("#")[0].strip()[:88] or "Insane Stream Reaction"
+            post_input["metadata"] = {
+                "youtube": {
+                    "title": f"{yt_title} #shorts"[:100],
+                    "categoryId": "20",
+                    "privacy": "public",
+                    "madeForKids": False,
+                    "license": "youtube",
+                    "embeddable": True,
+                    "notifySubscribers": True
+                }
+            }
 
         res = requests.post(url, headers=headers, json={"query": mutation, "variables": {"input": post_input}}).json()
         print(f"Published clip to {ch['service']} ({ch['name']}):", res)
@@ -361,7 +375,7 @@ if __name__ == "__main__":
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
         final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["cam_pos"])
-        caption = make_viral_caption(streamer["name"], transcript, is_gta6=candidate["is_gta6"])
+        caption = make_viral_caption(streamer, transcript, is_gta6=candidate["is_gta6"])
 
         upload = cloudinary.uploader.upload(final_clip, resource_type="video")
         try:
