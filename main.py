@@ -244,6 +244,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def detect_facecam_box(video_path):
+    if not hasattr(cv2, "CascadeClassifier"):
+        print("cv2.CascadeClassifier unavailable; skipping face detection.")
+        return None
+
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -252,10 +256,14 @@ def detect_facecam_box(video_path):
         cap.release()
         return None
 
-    frontal = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
-    detections = []
+    cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
+    frontal = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_default.xml")
+    profile = cv2.CascadeClassifier(cascade_dir + "haarcascade_profileface.xml")
+    if frontal.empty():
+        cap.release()
+        return None
 
+    detections = []
     for frac in (0.10, 0.25, 0.40, 0.55, 0.70, 0.85):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
         ok, frame = cap.read()
@@ -263,7 +271,7 @@ def detect_facecam_box(video_path):
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = list(frontal.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(36, 36)))
-        if not faces:
+        if not faces and not profile.empty():
             faces = list(profile.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(36, 36)))
 
         for (fx, fy, fw, fh) in faces:
