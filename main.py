@@ -19,12 +19,12 @@ HISTORY_FILE = "posted_history.json"
 
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
-# Add any Twitch or YouTube stream/video tabs you want to auto-clip
+# Twitch top 24h clips download in ~2 seconds and already capture viral stream moments!
 # cam_pos options: "top-left", "top-right", "bottom-left", "bottom-right"
 STREAMERS = [
-    {"name": "KaiCenat", "url": "https://www.twitch.tv/kaicenat/videos?filter=archives&sort=time", "cam_pos": "top-left"},
-    {"name": "xQc", "url": "https://www.twitch.tv/xqc/videos?filter=archives&sort=time", "cam_pos": "top-left"},
-    {"name": "CaseOh", "url": "https://www.twitch.tv/caseoh_/videos?filter=archives&sort=time", "cam_pos": "top-left"},
+    {"name": "KaiCenat", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
+    {"name": "xQc", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
+    {"name": "CaseOh", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
     {"name": "IShowSpeed", "url": "https://www.youtube.com/@IShowSpeed/streams", "cam_pos": "top-left"},
 ]
 
@@ -45,10 +45,10 @@ def save_history(history):
         json.dump(history, f, indent=2)
 
 
-def fetch_stream_chunk(streamer, raw_output="raw_stream.mp4"):
+def fetch_stream_chunk(streamer, history, raw_output="raw_stream.mp4"):
     """
-    Resolves the single newest stream/VOD URL first (--playlist-items 1),
-    then downloads only a 3-minute slice so it never hangs on full channel playlists.
+    Fetches the top unposted 24h Twitch clip (instant ~2s download) or
+    a 2-minute highlight slice from a completed YouTube stream (skipping upcoming premieres).
     """
     if os.path.exists(raw_output):
         os.remove(raw_output)
@@ -58,66 +58,74 @@ def fetch_stream_chunk(streamer, raw_output="raw_stream.mp4"):
 
     try:
         probe = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-items", "1", url],
+            ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "5", url],
             capture_output=True, text=True, timeout=45
         )
     except subprocess.TimeoutExpired:
         print(f"Probe timed out for {streamer['name']}, skipping...")
         return None, None
 
-    target_url = None
-    video_id = None
-
+    candidates = []
     if probe.returncode == 0 and probe.stdout.strip():
         try:
             info = json.loads(probe.stdout)
             entries = info.get("entries") or [info]
             for entry in entries:
-                if entry:
-                    target_url = entry.get("webpage_url") or entry.get("url")
-                    video_id = entry.get("id")
-                    if target_url:
-                        break
+                if not entry:
+                    continue
+                if entry.get("live_status") == "is_upcoming":
+                    continue
+                t_url = entry.get("webpage_url") or entry.get("url")
+                v_id = entry.get("id")
+                if t_url and v_id and v_id not in history["posted_ids"]:
+                    candidates.append((t_url, v_id))
         except Exception as e:
             print(f"JSON parse warning for {streamer['name']}: {e}")
 
-    if not target_url:
-        print(f"No stream/VOD URL found for {streamer['name']}, skipping...")
+    if not candidates:
+        print(f"No new unposted clips/streams found for {streamer['name']}, skipping...")
         return None, None
 
-    if not video_id or video_id.lower() == streamer["name"].lower():
-            video_id = f"{streamer['name']}_{int(time.time() // 10800)}"
+    target_url, video_id = candidates[0]
+    print(f"Selected for {streamer['name']}: {target_url} (ID: {video_id})")
 
-    print(f"Found latest stream/VOD for {streamer['name']}: {target_url} (ID: {video_id})")
+    is_twitch_clip = "twitch.tv" in target_url and "/clip/" in target_url
 
-    # Try a 3-minute highlight window 20 minutes into the VOD/stream
-    for section in ["*00:20:00-00:23:00", "*00:01:00-00:04:00"]:
+    if is_twitch_clip:
         cmd = [
             "yt-dlp",
             "--no-playlist",
-            "--playlist-items", "1",
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
-            "--download-sections", section,
-            "--force-keyframes-at-cuts",
             "-o", raw_output,
             target_url
         ]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            if os.path.exists(raw_output) and os.path.getsize(raw_output) > 300_000:
-                return raw_output, video_id
-            print(f"Section {section} returned no file: {res.stderr[-250:]}")
-        except subprocess.TimeoutExpired:
-            print(f"Section {section} timed out for {streamer['name']}")
-            if os.path.exists(raw_output):
-                os.remove(raw_output)
+    else:
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-f", "bv*[height<=720]+ba/b[height<=720]/best",
+            "--merge-output-format", "mp4",
+            "--download-sections", "*00:15:00-00:17:00",
+            "-o", raw_output,
+            target_url
+        ]
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if os.path.exists(raw_output) and os.path.getsize(raw_output) > 250_000:
+            return raw_output, video_id
+        print(f"Download failed for {streamer['name']}: {res.stderr[-300:]}")
+    except subprocess.TimeoutExpired:
+        print(f"Download timed out for {streamer['name']}")
+        if os.path.exists(raw_output):
+            os.remove(raw_output)
 
     return None, None
 
 
 def find_hype_window(video_path, clip_len=38):
-    """Finds the loudest reaction/screaming spike in the 3-minute capture."""
+    """Finds the loudest reaction/screaming spike (or uses the full clip if <= 42s)."""
     wav_path = "temp_audio.wav"
     subprocess.run(
         ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav_path],
@@ -130,8 +138,8 @@ def find_hype_window(video_path, clip_len=38):
         samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
 
     total_sec = len(samples) / rate
-    if total_sec <= clip_len + 2:
-        return 0.0, min(clip_len, total_sec)
+    if total_sec <= clip_len + 4:
+        return 0.0, max(5.0, total_sec)
 
     sec_energies = []
     for s in range(int(total_sec)):
@@ -194,12 +202,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="final_clip.mp4"):
-    """
-    Builds a 1080x1920 vertical split-screen video:
-    - Top (1080x660): Zoomed Facecam
-    - Bottom (1080x1260): Center-cropped Gameplay
-    - Center Seam: Burned-in animated subtitles
-    """
+    """Builds a 1080x1920 vertical split-screen video with facecam top, game bottom, and subtitles."""
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -313,8 +316,8 @@ if __name__ == "__main__":
     random.shuffle(STREAMERS)
 
     for streamer in STREAMERS:
-        raw_file, vid_id = fetch_stream_chunk(streamer)
-        if not raw_file or vid_id in history["posted_ids"]:
+        raw_file, vid_id = fetch_stream_chunk(streamer, history)
+        if not raw_file:
             continue
 
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
@@ -326,7 +329,7 @@ if __name__ == "__main__":
             publish_to_all_platforms(upload["secure_url"], caption)
             history["posted_ids"].append(vid_id)
             save_history(history)
-            time.sleep(180)
+            time.sleep(90)
         finally:
             cloudinary.uploader.destroy(upload["public_id"], resource_type="video")
         break
