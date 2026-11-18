@@ -22,7 +22,7 @@ cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
 STREAMERS = [
     {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "fallback_cam": "top-left"},
-    {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "fallback_cam": "bottom-left"},
+    {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "fallback_cam": "gta-left"},
     {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "fallback_cam": "mid-left"},
     {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams", "fallback_cam": "top-left"},
 ]
@@ -284,7 +284,7 @@ def detect_facecam_box(video_path):
 
         for (fx, fy, fw, fh) in faces:
             cx, cy = fx + fw / 2.0, fy + fh / 2.0
-            if cx < w * 0.40 or cx > w * 0.60:
+            if cx < w * 0.35 or cx > w * 0.65:
                 detections.append((cx, cy))
     cap.release()
 
@@ -294,18 +294,15 @@ def detect_facecam_box(video_path):
     med_cx = float(np.median([d[0] for d in detections]))
     med_cy = float(np.median([d[1] for d in detections]))
 
-    crop_w = int(w * 0.28)
-    crop_h = int(h * 0.32)
-    x0 = max(0, min(int(med_cx - crop_w / 2), w - crop_w))
-    y0 = max(0, min(int(med_cy - crop_h / 2), h - crop_h))
+    # Tighter webcam framing centered slightly above the face center so the head/shoulders fill the top box cleanly
+    crop_w = int(w * 0.24)
+    crop_h = int(h * 0.26)
+    x0 = max(0, min(int(med_cx - crop_w * 0.50), w - crop_w))
+    y0 = max(0, min(int(med_cy - crop_h * 0.42), h - crop_h))
     return f"crop={crop_w}:{crop_h}:{x0}:{y0}"
 
 
 def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
-    """
-    Uses OpenCV face tracking to lock onto the streamer's webcam in any corner,
-    and falls back to the streamer's default webcam corner if dark lighting/headsets hide the face.
-    """
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -317,12 +314,14 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
         capture_output=True, check=True
     )
 
+    # Calibrated webcam boxes for each streamer's OBS overlay position
     cam_crops = {
-        "top-left": "crop=iw*0.28:ih*0.32:0:0",
-        "mid-left": "crop=iw*0.28:ih*0.32:0:ih*0.18",
-        "top-right": "crop=iw*0.28:ih*0.32:iw*0.72:0",
-        "bottom-left": "crop=iw*0.28:ih*0.32:0:ih*0.68",
-        "bottom-right": "crop=iw*0.28:ih*0.32:iw*0.72:ih*0.68",
+        "top-left": "crop=iw*0.24:ih*0.26:0:0",
+        "mid-left": "crop=iw*0.24:ih*0.26:0:ih*0.18",
+        "gta-left": "crop=iw*0.23:ih*0.25:0:ih*0.49",
+        "top-right": "crop=iw*0.24:ih*0.26:iw*0.76:0",
+        "bottom-left": "crop=iw*0.24:ih*0.26:0:ih*0.72",
+        "bottom-right": "crop=iw*0.24:ih*0.26:iw*0.76:ih*0.72",
     }
 
     cam_crop = detect_facecam_box(trimmed)
@@ -330,7 +329,7 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
         print(f"Facecam locked via OpenCV: {cam_crop}")
     else:
         cam_crop = cam_crops.get(fallback_cam, cam_crops["top-left"])
-        print(f"Using streamer default facecam corner ({fallback_cam}): {cam_crop}")
+        print(f"Using streamer calibrated facecam box ({fallback_cam}): {cam_crop}")
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", trimmed, "-ac", "1", "-ar", "16000", clip_wav],
@@ -359,27 +358,41 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
     return output_path, transcript
 
 
-def make_viral_caption(streamer, transcript, is_gta6=False):
+def make_viral_caption(streamer, transcript, clip_title="", is_gta6=False):
     name = streamer["name"]
     platform = streamer.get("platform", "Twitch")
     game_tag = "#gta6 " if is_gta6 else ""
     credit_line = f"Credit: @{name} on {platform}"
-    fallback = f"{name}'s reaction is unreal 💀🔥 {game_tag}#gaming #{name.lower()} #shorts\n\n{credit_line}"
 
-    if not GEMINI_API_KEY or not transcript.strip():
+    clean_clip_title = re.sub(r"[^\w\s'!?.,-]", "", clip_title).strip()
+    if clean_clip_title and len(clean_clip_title) > 4:
+        fallback_hook = f"{clean_clip_title[:65]} ({name}) 💀 {game_tag}#gaming #{name.lower()} #shorts"
+    else:
+        fallback_hook = f"{name} couldn't believe what just happened 💀 {game_tag}#gaming #{name.lower()} #shorts"
+
+    fallback = f"{fallback_hook}\n\n{credit_line}"
+
+    if not GEMINI_API_KEY:
         return fallback
+
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
-            f"Write a short, viral 1-sentence YouTube Shorts / TikTok hook caption (under 85 chars) for a gaming clip of {name}. "
-            f"Transcript snippet: '{transcript[:250]}'. "
-            f"Include {game_tag}#gaming #shorts and #{name.lower()}. Return ONLY the caption text."
+            f"Write a unique, punchy, viral 1-sentence YouTube Shorts title/caption (under 75 chars) about this specific clip of {name}. "
+            f"Original clip title: '{clean_clip_title}'. "
+            f"Spoken dialogue: '{transcript[:280]}'. "
+            f"Make it specific to what happened in the clip—never use generic phrases like 'reaction is unreal'. "
+            f"End with {game_tag}#gaming #{name.lower()} #shorts. Return ONLY the single caption line."
         )
-        res = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
-        hook = res.text.strip()[:120] or f"{name}'s reaction is unreal 💀🔥 {game_tag}#gaming #{name.lower()} #shorts"
-        return f"{hook}\n\n{credit_line}"
-    except Exception:
-        return fallback
+        res = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        hook = res.text.strip().splitlines()[0][:125]
+        if hook:
+            print(f"Generated unique AI caption: {hook}")
+            return f"{hook}\n\n{credit_line}"
+    except Exception as e:
+        print(f"Gemini caption warning ({e}); using clip-title fallback.")
+
+    return fallback
 
 
 def publish_to_all_platforms(public_video_url, caption):
@@ -428,7 +441,7 @@ def publish_to_all_platforms(public_video_url, caption):
             post_input["metadata"] = {"instagram": {"type": "reel", "shouldShareToFeed": True}}
         elif service == "youtube":
             first_line = caption.splitlines()[0]
-            yt_title = first_line.split("#")[0].strip()[:88] or "Insane Stream Reaction"
+            yt_title = first_line.split("#")[0].strip()[:88] or "Crazy Stream Moment"
             post_input["metadata"] = {
                 "youtube": {
                     "title": f"{yt_title} #shorts"[:100],
@@ -466,7 +479,12 @@ if __name__ == "__main__":
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
         final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["fallback_cam"])
-        caption = make_viral_caption(streamer, transcript, is_gta6=candidate["is_gta6"])
+        caption = make_viral_caption(
+            streamer,
+            transcript,
+            clip_title=candidate.get("title", ""),
+            is_gta6=candidate["is_gta6"]
+        )
 
         upload = cloudinary.uploader.upload(final_clip, resource_type="video")
         try:
