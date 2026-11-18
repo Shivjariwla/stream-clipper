@@ -20,11 +20,11 @@ HISTORY_FILE = "posted_history.json"
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
 # Twitch top 24h clips download in ~2 seconds and already capture viral stream moments!
-# cam_pos options: "top-left", "top-right", "bottom-left", "bottom-right"
+# cam_pos options: "top-left", "mid-left", "top-right", "bottom-left", "bottom-right"
 STREAMERS = [
     {"name": "KaiCenat", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
     {"name": "xQc", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
-    {"name": "CaseOh", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
+    {"name": "CaseOh", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "cam_pos": "mid-left"},
     {"name": "IShowSpeed", "url": "https://www.youtube.com/@IShowSpeed/streams", "cam_pos": "top-left"},
 ]
 
@@ -154,7 +154,7 @@ def find_hype_window(video_path, clip_len=38):
 
 def generate_word_subtitles(clip_audio_path, ass_path="subs.ass"):
     """Transcribes clip audio with Faster-Whisper word timestamps into styled ASS subtitles."""
-    model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    model = WhisperModel("base.en", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(clip_audio_path, word_timestamps=True)
 
     ass_header = """[Script Info]
@@ -164,7 +164,7 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,68,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,5,60,60,0,1
+Style: Default,Arial,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,1215,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -191,7 +191,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if not phrase:
             continue
         start_t = fmt_time(group[0][1])
-        end_t = fmt_time(max(group[-1][2], group[0][1] + 0.25))
+        end_sec = min(group[-1][2] + 0.25, group[0][1] + 2.2)
+        end_t = fmt_time(max(end_sec, group[0][1] + 0.3))
         lines.append(f"Dialogue: 0,{start_t},{end_t},Default,,0,0,0,,{phrase}")
         transcript_parts.append(phrase)
 
@@ -222,6 +223,7 @@ def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="fina
 
     cam_crops = {
         "top-left": "crop=iw*0.26:ih*0.30:0:0",
+        "mid-left": "crop=iw*0.26:ih*0.30:0:ih*0.18",
         "top-right": "crop=iw*0.26:ih*0.30:iw*0.74:0",
         "bottom-left": "crop=iw*0.26:ih*0.30:0:ih*0.70",
         "bottom-right": "crop=iw*0.26:ih*0.30:iw*0.74:ih*0.70",
