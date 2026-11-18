@@ -68,7 +68,7 @@ def collect_viral_candidates(streamers, history):
         print(f"Scanning {streamer['name']} ({url})...")
         try:
             probe = subprocess.run(
-                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "6", url],
+                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "10", url],
                 capture_output=True, text=True, timeout=45
             )
         except subprocess.TimeoutExpired:
@@ -121,7 +121,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
 
     target_url = candidate["url"]
     name = candidate["streamer"]["name"]
-    print(f"Downloading top viral pick: {name} | {candidate['views']:,} views | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
+    print(f"Downloading candidate: {name} | {candidate['views']:,} views | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
 
     is_twitch_clip = "twitch.tv" in target_url and "/clip/" in target_url
     if is_twitch_clip:
@@ -143,6 +143,14 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if os.path.exists(raw_output) and os.path.getsize(raw_output) > 250_000:
+            # Verify it is a horizontal 16:9 stream clip (skip pre-cropped vertical edits)
+            cap = cv2.VideoCapture(raw_output)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            if w <= h:
+                print(f"Skipping vertical/pre-edited clip ({w}x{h}) for {name}...")
+                return None
             return raw_output
         print(f"Download failed for {name}: {res.stderr[-250:]}")
     except subprocess.TimeoutExpired:
@@ -245,7 +253,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def detect_facecam_box(video_path):
     if not hasattr(cv2, "CascadeClassifier"):
-        print("cv2.CascadeClassifier unavailable; skipping face detection.")
         return None
 
     cap = cv2.VideoCapture(video_path)
@@ -294,6 +301,10 @@ def detect_facecam_box(video_path):
 
 
 def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
+    """
+    Requires a detected streamer facecam in the clip so every published video
+    has Facecam at Top + Gameplay at Bottom. Returns (None, None) if no facecam is found.
+    """
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -304,28 +315,25 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
         ],
         capture_output=True, check=True
     )
+
+    detected_cam_crop = detect_facecam_box(trimmed)
+    if not detected_cam_crop:
+        print("No facecam detected in this clip — skipping to next candidate so facecam is always on top.")
+        return None, None
+
     subprocess.run(
         ["ffmpeg", "-y", "-i", trimmed, "-ac", "1", "-ar", "16000", clip_wav],
         capture_output=True, check=True
     )
-
     ass_file, transcript = generate_word_subtitles(clip_wav)
-    detected_cam_crop = detect_facecam_box(trimmed)
 
-    if detected_cam_crop:
-        print(f"Facecam locked via OpenCV: {detected_cam_crop}")
-        filter_complex = (
-            f"[0:v]{detected_cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
-            f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
-            f"[cam][game]vstack=inputs=2,setpts=0.97*PTS,ass={ass_file}[v];"
-            f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
-        )
-    else:
-        print("No facecam detected in clip — rendering full-screen vertical video.")
-        filter_complex = (
-            f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,eq=contrast=1.05:saturation=1.08,setpts=0.97*PTS,ass={ass_file}[v];"
-            f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
-        )
+    print(f"Facecam locked via OpenCV: {detected_cam_crop}")
+    filter_complex = (
+        f"[0:v]{detected_cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
+        f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
+        f"[cam][game]vstack=inputs=2,setpts=0.97*PTS,ass={ass_file}[v];"
+        f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
+    )
 
     subprocess.run(
         [
@@ -427,11 +435,18 @@ if __name__ == "__main__":
     for candidate in candidates:
         raw_file = download_candidate(candidate)
         if not raw_file:
+            history["posted_ids"].append(candidate["id"])
+            save_history(history)
             continue
 
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
         final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["fallback_cam"])
+        if not final_clip:
+            history["posted_ids"].append(candidate["id"])
+            save_history(history)
+            continue
+
         caption = make_viral_caption(streamer, transcript, is_gta6=candidate["is_gta6"])
 
         upload = cloudinary.uploader.upload(final_clip, resource_type="video")
