@@ -19,12 +19,12 @@ HISTORY_FILE = "posted_history.json"
 
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
-# Add any Twitch, YouTube, or Kick channels you want to auto-clip
+# Add any Twitch or YouTube stream/video tabs you want to auto-clip
 # cam_pos options: "top-left", "top-right", "bottom-left", "bottom-right"
 STREAMERS = [
-    {"name": "KaiCenat", "url": "https://www.twitch.tv/kaicenat", "cam_pos": "top-left"},
-    {"name": "xQc", "url": "https://www.twitch.tv/xqc", "cam_pos": "top-left"},
-    {"name": "CaseOh", "url": "https://www.twitch.tv/caseoh_", "cam_pos": "top-left"},
+    {"name": "KaiCenat", "url": "https://www.twitch.tv/kaicenat/videos?filter=archives&sort=time", "cam_pos": "top-left"},
+    {"name": "xQc", "url": "https://www.twitch.tv/xqc/videos?filter=archives&sort=time", "cam_pos": "top-left"},
+    {"name": "CaseOh", "url": "https://www.twitch.tv/caseoh_/videos?filter=archives&sort=time", "cam_pos": "top-left"},
     {"name": "IShowSpeed", "url": "https://www.youtube.com/@IShowSpeed/streams", "cam_pos": "top-left"},
 ]
 
@@ -47,8 +47,8 @@ def save_history(history):
 
 def fetch_stream_chunk(streamer, raw_output="raw_stream.mp4"):
     """
-    Captures a 3-minute live window if the streamer is live right now,
-    otherwise grabs a 3-minute section from their newest VOD/stream archive.
+    Resolves the single newest stream/VOD URL first (--playlist-items 1),
+    then downloads only a 3-minute slice so it never hangs on full channel playlists.
     """
     if os.path.exists(raw_output):
         os.remove(raw_output)
@@ -56,50 +56,63 @@ def fetch_stream_chunk(streamer, raw_output="raw_stream.mp4"):
     url = streamer["url"]
     print(f"Checking {streamer['name']} ({url})...")
 
-    probe = subprocess.run(
-        ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "3", url],
-        capture_output=True, text=True, timeout=45
-    )
+    try:
+        probe = subprocess.run(
+            ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-items", "1", url],
+            capture_output=True, text=True, timeout=45
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Probe timed out for {streamer['name']}, skipping...")
+        return None, None
 
-    target_url = url
-    video_id = f"{streamer['name']}_{int(time.time() // 3600)}"
+    target_url = None
+    video_id = None
 
     if probe.returncode == 0 and probe.stdout.strip():
         try:
             info = json.loads(probe.stdout)
             entries = info.get("entries") or [info]
             for entry in entries:
-                if entry and entry.get("url"):
-                    target_url = entry["url"]
-                    video_id = entry.get("id", video_id)
-                    break
-        except Exception:
-            pass
+                if entry:
+                    target_url = entry.get("webpage_url") or entry.get("url")
+                    video_id = entry.get("id")
+                    if target_url:
+                        break
+        except Exception as e:
+            print(f"JSON parse warning for {streamer['name']}: {e}")
 
-    cmd = [
-        "yt-dlp",
-        "-f", "bv*[height<=1080]+ba/b[height<=1080]/best",
-        "--merge-output-format", "mp4",
-        "--download-sections", "*00:15:00-00:18:00",
-        "--force-keyframes-at-cuts",
-        "-o", raw_output,
-        target_url
-    ]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    if not target_url:
+        print(f"No stream/VOD URL found for {streamer['name']}, skipping...")
+        return None, None
 
-    if not os.path.exists(raw_output) or os.path.getsize(raw_output) < 500_000:
-        live_cmd = [
+    if not video_id:
+        video_id = f"{streamer['name']}_{int(time.time() // 3600)}"
+
+    print(f"Found latest stream/VOD for {streamer['name']}: {target_url} (ID: {video_id})")
+
+    # Try a 3-minute highlight window 20 minutes into the VOD/stream
+    for section in ["*00:20:00-00:23:00", "*00:01:00-00:04:00"]:
+        cmd = [
             "yt-dlp",
-            "-f", "bv*[height<=1080]+ba/b[height<=1080]/best",
+            "--no-playlist",
+            "--playlist-items", "1",
+            "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
-            "--download-sections", "*00:00:00-00:03:00",
+            "--download-sections", section,
+            "--force-keyframes-at-cuts",
             "-o", raw_output,
-            url
+            target_url
         ]
-        subprocess.run(live_cmd, capture_output=True, text=True, timeout=240)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if os.path.exists(raw_output) and os.path.getsize(raw_output) > 300_000:
+                return raw_output, video_id
+            print(f"Section {section} returned no file: {res.stderr[-250:]}")
+        except subprocess.TimeoutExpired:
+            print(f"Section {section} timed out for {streamer['name']}")
+            if os.path.exists(raw_output):
+                os.remove(raw_output)
 
-    if os.path.exists(raw_output) and os.path.getsize(raw_output) > 500_000:
-        return raw_output, video_id
     return None, None
 
 
@@ -186,7 +199,6 @@ def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="fina
     - Top (1080x660): Zoomed Facecam
     - Bottom (1080x1260): Center-cropped Gameplay
     - Center Seam: Burned-in animated subtitles
-    - Audio/Video Transform: Slight speed/pitch + voice-band EQ to reduce Content ID music flags
     """
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
@@ -235,7 +247,7 @@ def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="fina
 
 
 def make_viral_caption(streamer_name, transcript):
-    fallback = f"{streamer_name}'s reaction to GTA 6 is unreal 💀🔥 #gta6 #gaming #{streamer_name.lower()} #twitch #shorts"
+    fallback = f"{streamer_name}'s reaction is unreal 💀🔥 #gaming #{streamer_name.lower()} #twitch #shorts"
     if not GEMINI_API_KEY or not transcript.strip():
         return fallback
     try:
@@ -243,7 +255,7 @@ def make_viral_caption(streamer_name, transcript):
         prompt = (
             f"Write a short, viral 1-sentence YouTube Shorts / TikTok caption (under 90 chars) for a gaming clip of {streamer_name}. "
             f"Transcript snippet: '{transcript[:250]}'. "
-            f"Include #gta6 #gaming #shorts and #{streamer_name.lower()}. Return ONLY the caption text."
+            f"Include #gaming #shorts and #{streamer_name.lower()}. Return ONLY the caption text."
         )
         res = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
         return res.text.strip()[:140] or fallback
@@ -289,7 +301,7 @@ def publish_to_all_platforms(public_video_url, caption):
         if service == "instagram":
             post_input["metadata"] = {"instagram": {"type": "reel", "shouldShareToFeed": True}}
         elif service == "youtube":
-            yt_title = caption.split("#")[0].strip()[:88] or "Insane GTA 6 Stream Reaction"
+            yt_title = caption.split("#")[0].strip()[:88] or "Insane Stream Reaction"
             post_input["metadata"] = {"youtube": {"title": f"{yt_title} #shorts"[:100], "categoryId": "20"}}
 
         res = requests.post(url, headers=headers, json={"query": mutation, "variables": {"input": post_input}}).json()
