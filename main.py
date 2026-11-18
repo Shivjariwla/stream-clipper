@@ -5,6 +5,7 @@ import re
 import subprocess
 import time
 import wave
+import cv2
 import numpy as np
 import requests
 import cloudinary
@@ -19,12 +20,11 @@ HISTORY_FILE = "posted_history.json"
 
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
-# cam_pos options: "top-left", "mid-left", "top-right", "bottom-left", "bottom-right"
 STREAMERS = [
-    {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
-    {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
-    {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "cam_pos": "mid-left"},
-    {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams", "cam_pos": "top-left"},
+    {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "fallback_cam": "top-left"},
+    {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "fallback_cam": "bottom-left"},
+    {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "fallback_cam": "mid-left"},
+    {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams", "fallback_cam": "top-left"},
 ]
 
 GTA6_KEYWORDS = ("gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi", "grand theft auto 6")
@@ -60,10 +60,6 @@ def save_history(history):
 
 
 def collect_viral_candidates(streamers, history):
-    """
-    Probes all streamers and collects unposted clips/streams with view counts,
-    ranking by: (1) GTA 6 match, (2) not repeating the exact last streamer, (3) highest view count.
-    """
     candidates = []
     last_streamer = history.get("last_streamer", "")
 
@@ -158,7 +154,6 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
 
 
 def find_hype_window(video_path, clip_len=38):
-    """Finds the loudest reaction/screaming spike (or uses the full clip if <= 42s)."""
     wav_path = "temp_audio.wav"
     subprocess.run(
         ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav_path],
@@ -186,7 +181,6 @@ def find_hype_window(video_path, clip_len=38):
 
 
 def generate_word_subtitles(clip_audio_path, ass_path="subs.ass"):
-    """Transcribes clip audio with Faster-Whisper word timestamps into styled ASS subtitles."""
     model = WhisperModel("base.en", device="cpu", compute_type="int8")
     segments, _ = model.transcribe(clip_audio_path, word_timestamps=True)
 
@@ -235,8 +229,49 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return ass_path, " ".join(transcript_parts)
 
 
-def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="final_clip.mp4"):
-    """Builds a 1080x1920 vertical split-screen video with facecam top, game bottom, and subtitles."""
+def detect_facecam_box(video_path):
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if total_frames <= 0 or w <= 0 or h <= 0:
+        cap.release()
+        return None
+
+    frontal = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+    detections = []
+
+    for frac in (0.10, 0.25, 0.40, 0.55, 0.70, 0.85):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(36, 36)))
+        if not faces:
+            faces = list(profile.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(36, 36)))
+
+        for (fx, fy, fw, fh) in faces:
+            cx, cy = fx + fw / 2.0, fy + fh / 2.0
+            if cx < w * 0.38 or cx > w * 0.62:
+                detections.append((cx, cy))
+    cap.release()
+
+    if not detections:
+        return None
+
+    med_cx = float(np.median([d[0] for d in detections]))
+    med_cy = float(np.median([d[1] for d in detections]))
+
+    crop_w = int(w * 0.28)
+    crop_h = int(h * 0.32)
+    x0 = max(0, min(int(med_cx - crop_w / 2), w - crop_w))
+    y0 = max(0, min(int(med_cy - crop_h / 2), h - crop_h))
+    return f"crop={crop_w}:{crop_h}:{x0}:{y0}"
+
+
+def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -253,22 +288,22 @@ def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="fina
     )
 
     ass_file, transcript = generate_word_subtitles(clip_wav)
+    detected_cam_crop = detect_facecam_box(trimmed)
 
-    cam_crops = {
-        "top-left": "crop=iw*0.26:ih*0.30:0:0",
-        "mid-left": "crop=iw*0.26:ih*0.30:0:ih*0.18",
-        "top-right": "crop=iw*0.26:ih*0.30:iw*0.74:0",
-        "bottom-left": "crop=iw*0.26:ih*0.30:0:ih*0.70",
-        "bottom-right": "crop=iw*0.26:ih*0.30:iw*0.74:ih*0.70",
-    }
-    cam_crop = cam_crops.get(cam_pos, cam_crops["top-left"])
-
-    filter_complex = (
-        f"[0:v]{cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
-        f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
-        f"[cam][game]vstack=inputs=2,setpts=0.97*PTS,ass={ass_file}[v];"
-        f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
-    )
+    if detected_cam_crop:
+        print(f"Facecam locked via OpenCV: {detected_cam_crop}")
+        filter_complex = (
+            f"[0:v]{detected_cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
+            f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
+            f"[cam][game]vstack=inputs=2,setpts=0.97*PTS,ass={ass_file}[v];"
+            f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
+        )
+    else:
+        print("No facecam detected in clip — rendering full-screen vertical video.")
+        filter_complex = (
+            f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,eq=contrast=1.05:saturation=1.08,setpts=0.97*PTS,ass={ass_file}[v];"
+            f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
+        )
 
     subprocess.run(
         [
@@ -374,7 +409,7 @@ if __name__ == "__main__":
 
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
-        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["cam_pos"])
+        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["fallback_cam"])
         caption = make_viral_caption(streamer, transcript, is_gta6=candidate["is_gta6"])
 
         upload = cloudinary.uploader.upload(final_clip, resource_type="video")
