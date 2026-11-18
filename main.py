@@ -54,7 +54,7 @@ def load_history():
 
 
 def save_history(history):
-    history["posted_ids"] = history["posted_ids"][-200:]
+    history["posted_ids"] = history["posted_ids"][-300:]
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
@@ -68,7 +68,7 @@ def collect_viral_candidates(streamers, history):
         print(f"Scanning {streamer['name']} ({url})...")
         try:
             probe = subprocess.run(
-                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "10", url],
+                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "25", url],
                 capture_output=True, text=True, timeout=45
             )
         except subprocess.TimeoutExpired:
@@ -112,6 +112,7 @@ def collect_viral_candidates(streamers, history):
         key=lambda c: (c["is_gta6"], c["different_creator"], c["weighted_views"]),
         reverse=True
     )
+    print(f"Total unposted candidates found: {len(candidates)}")
     return candidates
 
 
@@ -270,19 +271,20 @@ def detect_facecam_box(video_path):
         return None
 
     detections = []
-    for frac in (0.10, 0.25, 0.40, 0.55, 0.70, 0.85):
+    for frac in (0.08, 0.20, 0.32, 0.44, 0.56, 0.68, 0.80, 0.92):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
         ok, frame = cap.read()
         if not ok:
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(36, 36)))
+        gray = cv2.equalizeHist(gray)
+        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
         if not faces and not profile.empty():
-            faces = list(profile.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(36, 36)))
+            faces = list(profile.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
 
         for (fx, fy, fw, fh) in faces:
             cx, cy = fx + fw / 2.0, fy + fh / 2.0
-            if cx < w * 0.38 or cx > w * 0.62:
+            if cx < w * 0.40 or cx > w * 0.60:
                 detections.append((cx, cy))
     cap.release()
 
@@ -300,6 +302,10 @@ def detect_facecam_box(video_path):
 
 
 def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
+    """
+    Uses OpenCV face tracking to lock onto the streamer's webcam in any corner,
+    and falls back to the streamer's default webcam corner if dark lighting/headsets hide the face.
+    """
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -311,10 +317,20 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
         capture_output=True, check=True
     )
 
-    detected_cam_crop = detect_facecam_box(trimmed)
-    if not detected_cam_crop:
-        print("No facecam detected in this clip — skipping to next candidate so facecam is always on top.")
-        return None, None
+    cam_crops = {
+        "top-left": "crop=iw*0.28:ih*0.32:0:0",
+        "mid-left": "crop=iw*0.28:ih*0.32:0:ih*0.18",
+        "top-right": "crop=iw*0.28:ih*0.32:iw*0.72:0",
+        "bottom-left": "crop=iw*0.28:ih*0.32:0:ih*0.68",
+        "bottom-right": "crop=iw*0.28:ih*0.32:iw*0.72:ih*0.68",
+    }
+
+    cam_crop = detect_facecam_box(trimmed)
+    if cam_crop:
+        print(f"Facecam locked via OpenCV: {cam_crop}")
+    else:
+        cam_crop = cam_crops.get(fallback_cam, cam_crops["top-left"])
+        print(f"Using streamer default facecam corner ({fallback_cam}): {cam_crop}")
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", trimmed, "-ac", "1", "-ar", "16000", clip_wav],
@@ -322,9 +338,8 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
     )
     ass_file, transcript = generate_word_subtitles(clip_wav)
 
-    print(f"Facecam locked via OpenCV: {detected_cam_crop}")
     filter_complex = (
-        f"[0:v]{detected_cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
+        f"[0:v]{cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
         f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
         f"[cam][game]vstack=inputs=2,setpts=0.97*PTS,ass={ass_file}[v];"
         f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
@@ -451,11 +466,6 @@ if __name__ == "__main__":
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
         final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["fallback_cam"])
-        if not final_clip:
-            history["posted_ids"].append(candidate["id"])
-            save_history(history)
-            continue
-
         caption = make_viral_caption(streamer, transcript, is_gta6=candidate["is_gta6"])
 
         upload = cloudinary.uploader.upload(final_clip, resource_type="video")
