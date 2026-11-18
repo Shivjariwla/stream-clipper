@@ -19,7 +19,6 @@ HISTORY_FILE = "posted_history.json"
 
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
-# Twitch top 24h clips download in ~2 seconds and already capture viral stream moments!
 # cam_pos options: "top-left", "mid-left", "top-right", "bottom-left", "bottom-right"
 STREAMERS = [
     {"name": "KaiCenat", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "cam_pos": "top-left"},
@@ -28,15 +27,30 @@ STREAMERS = [
     {"name": "IShowSpeed", "url": "https://www.youtube.com/@IShowSpeed/streams", "cam_pos": "top-left"},
 ]
 
+GTA6_KEYWORDS = ("gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi", "grand theft auto 6")
+
+
+def is_gta6_entry(entry):
+    text = " ".join([
+        str(entry.get("title", "")),
+        str(entry.get("description", "")),
+        " ".join(entry.get("categories") or []),
+        " ".join(entry.get("tags") or []),
+    ]).lower()
+    return any(k in text for k in GTA6_KEYWORDS)
+
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                data.setdefault("posted_ids", [])
+                data.setdefault("last_streamer", "")
+                return data
         except Exception:
             pass
-    return {"posted_ids": []}
+    return {"posted_ids": [], "last_streamer": ""}
 
 
 def save_history(history):
@@ -45,83 +59,104 @@ def save_history(history):
         json.dump(history, f, indent=2)
 
 
-def fetch_stream_chunk(streamer, history, raw_output="raw_stream.mp4"):
+def collect_viral_candidates(streamers, history):
     """
-    Fetches the top unposted 24h Twitch clip (instant ~2s download) or
-    a 2-minute highlight slice from a completed YouTube stream (skipping upcoming premieres).
+    Probes all streamers and collects their unposted clips/streams along with view counts,
+    ranking by: (1) GTA 6 match, (2) not repeating the exact last streamer, (3) highest view count.
     """
-    if os.path.exists(raw_output):
-        os.remove(raw_output)
-
-    url = streamer["url"]
-    print(f"Checking {streamer['name']} ({url})...")
-
-    try:
-        probe = subprocess.run(
-            ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "5", url],
-            capture_output=True, text=True, timeout=45
-        )
-    except subprocess.TimeoutExpired:
-        print(f"Probe timed out for {streamer['name']}, skipping...")
-        return None, None
-
     candidates = []
-    if probe.returncode == 0 and probe.stdout.strip():
+    last_streamer = history.get("last_streamer", "")
+
+    for streamer in streamers:
+        url = streamer["url"]
+        print(f"Scanning {streamer['name']} ({url})...")
+        try:
+            probe = subprocess.run(
+                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "6", url],
+                capture_output=True, text=True, timeout=45
+            )
+        except subprocess.TimeoutExpired:
+            print(f"Probe timed out for {streamer['name']}, skipping...")
+            continue
+
+        if probe.returncode != 0 or not probe.stdout.strip():
+            continue
+
         try:
             info = json.loads(probe.stdout)
             entries = info.get("entries") or [info]
             for entry in entries:
-                if not entry:
-                    continue
-                if entry.get("live_status") == "is_upcoming":
+                if not entry or entry.get("live_status") == "is_upcoming":
                     continue
                 t_url = entry.get("webpage_url") or entry.get("url")
                 v_id = entry.get("id")
-                if t_url and v_id and v_id not in history["posted_ids"]:
-                    candidates.append((t_url, v_id))
+                if not t_url or not v_id or v_id in history["posted_ids"]:
+                    continue
+
+                views = int(entry.get("view_count") or 0)
+                gta6_match = is_gta6_entry(entry)
+                is_different_creator = (streamer["name"] != last_streamer)
+
+                candidates.append({
+                    "streamer": streamer,
+                    "url": t_url,
+                    "id": v_id,
+                    "views": views,
+                    "is_gta6": gta6_match,
+                    "different_creator": is_different_creator,
+                    "title": entry.get("title", ""),
+                })
         except Exception as e:
-            print(f"JSON parse warning for {streamer['name']}: {e}")
+            print(f"Parse warning for {streamer['name']}: {e}")
 
-    if not candidates:
-        print(f"No new unposted clips/streams found for {streamer['name']}, skipping...")
-        return None, None
+    # Add slight randomness (+-15%) to view counts so similarly viral clips mix naturally
+    for c in candidates:
+        c["weighted_views"] = c["views"] * random.uniform(0.85, 1.15)
 
-    target_url, video_id = candidates[0]
-    print(f"Selected for {streamer['name']}: {target_url} (ID: {video_id})")
+    # Sort priority: GTA 6 first -> different streamer than last post -> highest viral views
+    candidates.sort(
+        key=lambda c: (c["is_gta6"], c["different_creator"], c["weighted_views"]),
+        reverse=True
+    )
+    return candidates
+
+
+def download_candidate(candidate, raw_output="raw_stream.mp4"):
+    if os.path.exists(raw_output):
+        os.remove(raw_output)
+
+    target_url = candidate["url"]
+    name = candidate["streamer"]["name"]
+    print(f"Downloading top viral pick: {name} | {candidate['views']:,} views | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
 
     is_twitch_clip = "twitch.tv" in target_url and "/clip/" in target_url
-
     if is_twitch_clip:
         cmd = [
-            "yt-dlp",
-            "--no-playlist",
+            "yt-dlp", "--no-playlist",
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
-            "-o", raw_output,
-            target_url
+            "-o", raw_output, target_url
         ]
     else:
         cmd = [
-            "yt-dlp",
-            "--no-playlist",
+            "yt-dlp", "--no-playlist",
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
             "--download-sections", "*00:15:00-00:17:00",
-            "-o", raw_output,
-            target_url
+            "-o", raw_output, target_url
         ]
 
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if os.path.exists(raw_output) and os.path.getsize(raw_output) > 250_000:
-            return raw_output, video_id
-        print(f"Download failed for {streamer['name']}: {res.stderr[-300:]}")
+            return raw_output
+        print(f"Download failed for {name}: {res.stderr[-250:]}")
     except subprocess.TimeoutExpired:
-        print(f"Download timed out for {streamer['name']}")
+        print(f"Download timed out for {name}")
         if os.path.exists(raw_output):
             os.remove(raw_output)
 
-    return None, None
+    return None
 
 
 def find_hype_window(video_path, clip_len=38):
@@ -251,8 +286,9 @@ def render_split_clip(raw_video, start_sec, duration, cam_pos, output_path="fina
     return output_path, transcript
 
 
-def make_viral_caption(streamer_name, transcript):
-    fallback = f"{streamer_name}'s reaction is unreal 💀🔥 #gaming #{streamer_name.lower()} #twitch #shorts"
+def make_viral_caption(streamer_name, transcript, is_gta6=False):
+    game_tag = "#gta6 " if is_gta6 else ""
+    fallback = f"{streamer_name}'s reaction is unreal 💀🔥 {game_tag}#gaming #{streamer_name.lower()} #twitch #shorts"
     if not GEMINI_API_KEY or not transcript.strip():
         return fallback
     try:
@@ -260,7 +296,7 @@ def make_viral_caption(streamer_name, transcript):
         prompt = (
             f"Write a short, viral 1-sentence YouTube Shorts / TikTok caption (under 90 chars) for a gaming clip of {streamer_name}. "
             f"Transcript snippet: '{transcript[:250]}'. "
-            f"Include #gaming #shorts and #{streamer_name.lower()}. Return ONLY the caption text."
+            f"Include {game_tag}#gaming #shorts and #{streamer_name.lower()}. Return ONLY the caption text."
         )
         res = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
         return res.text.strip()[:140] or fallback
@@ -315,21 +351,23 @@ def publish_to_all_platforms(public_video_url, caption):
 
 if __name__ == "__main__":
     history = load_history()
-    random.shuffle(STREAMERS)
+    candidates = collect_viral_candidates(STREAMERS, history)
 
-    for streamer in STREAMERS:
-        raw_file, vid_id = fetch_stream_chunk(streamer, history)
+    for candidate in candidates:
+        raw_file = download_candidate(candidate)
         if not raw_file:
             continue
 
+        streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
         final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["cam_pos"])
-        caption = make_viral_caption(streamer["name"], transcript)
+        caption = make_viral_caption(streamer["name"], transcript, is_gta6=candidate["is_gta6"])
 
         upload = cloudinary.uploader.upload(final_clip, resource_type="video")
         try:
             publish_to_all_platforms(upload["secure_url"], caption)
-            history["posted_ids"].append(vid_id)
+            history["posted_ids"].append(candidate["id"])
+            history["last_streamer"] = streamer["name"]
             save_history(history)
             time.sleep(90)
         finally:
