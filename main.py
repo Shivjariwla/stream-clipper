@@ -85,8 +85,8 @@ def fetch_stream_chunk(streamer, raw_output="raw_stream.mp4"):
         print(f"No stream/VOD URL found for {streamer['name']}, skipping...")
         return None, None
 
-    if not video_id:
-        video_id = f"{streamer['name']}_{int(time.time() // 3600)}"
+    if not video_id or video_id.lower() == streamer["name"].lower():
+            video_id = f"{streamer['name']}_{int(time.time() // 10800)}"
 
     print(f"Found latest stream/VOD for {streamer['name']}: {target_url} (ID: {video_id})")
 
