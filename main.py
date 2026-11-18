@@ -143,7 +143,6 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if os.path.exists(raw_output) and os.path.getsize(raw_output) > 250_000:
-            # Verify it is a horizontal 16:9 stream clip (skip pre-cropped vertical edits)
             cap = cv2.VideoCapture(raw_output)
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -301,10 +300,6 @@ def detect_facecam_box(video_path):
 
 
 def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
-    """
-    Requires a detected streamer facecam in the clip so every published video
-    has Facecam at Top + Gameplay at Bottom. Returns (None, None) if no facecam is found.
-    """
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -380,6 +375,8 @@ def publish_to_all_platforms(public_video_url, caption):
     }
 
     org_res = requests.post(url, headers=headers, json={"query": "query { account { organizations { id } } }"}).json()
+    if "errors" in org_res:
+        raise RuntimeError(f"Buffer org query failed: {org_res}")
     org_id = org_res["data"]["account"]["organizations"][0]["id"]
 
     ch_query = """
@@ -389,6 +386,10 @@ def publish_to_all_platforms(public_video_url, caption):
     """
     ch_res = requests.post(url, headers=headers, json={"query": ch_query, "variables": {"orgId": org_id}}).json()
     active_channels = [c for c in ch_res.get("data", {}).get("channels", []) if not c.get("isDisconnected")]
+    print(f"Found {len(active_channels)} active Buffer channels: {[c['service'] for c in active_channels]}")
+
+    if not active_channels:
+        raise RuntimeError("No active/connected Buffer channels found!")
 
     mutation = """
     mutation CreatePost($input: CreatePostInput!) {
@@ -398,6 +399,7 @@ def publish_to_all_platforms(public_video_url, caption):
       }
     }
     """
+    success_count = 0
     for ch in active_channels:
         service = ch["service"].lower()
         post_input = {
@@ -418,14 +420,21 @@ def publish_to_all_platforms(public_video_url, caption):
                     "categoryId": "20",
                     "privacy": "public",
                     "madeForKids": False,
-                    "license": "youtube",
-                    "embeddable": True,
                     "notifySubscribers": True
                 }
             }
 
         res = requests.post(url, headers=headers, json={"query": mutation, "variables": {"input": post_input}}).json()
-        print(f"Published clip to {ch['service']} ({ch['name']}):", res)
+        print(f"Buffer response for {ch['service']} ({ch['name']}):", json.dumps(res))
+
+        create_data = (res.get("data") or {}).get("createPost") or {}
+        if "post" in create_data:
+            success_count += 1
+        else:
+            print(f"WARNING: Failed to post to {ch['service']}: {res}")
+
+    if success_count == 0:
+        raise RuntimeError("Buffer rejected posts across all channels — check logs above.")
 
 
 if __name__ == "__main__":
