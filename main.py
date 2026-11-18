@@ -182,7 +182,6 @@ def find_hype_window(video_path, clip_len=38):
 
 def generate_word_subtitles(clip_audio_path, ass_path="subs.ass"):
     model = WhisperModel("base.en", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(clip_audio_path, word_timestamps=True)
 
     ass_header = """[Script Info]
 ScriptType: v4.00+
@@ -196,11 +195,6 @@ Style: Default,Arial,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    words = []
-    for seg in segments:
-        if seg.words:
-            for w in seg.words:
-                words.append((w.word.strip(), w.start, w.end))
 
     def fmt_time(t):
         h = int(t // 3600)
@@ -210,18 +204,38 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     lines = [ass_header]
     transcript_parts = []
-    chunk_size = 3
-    for i in range(0, len(words), chunk_size):
-        group = words[i : i + chunk_size]
-        phrase = " ".join(w[0] for w in group).upper()
-        phrase = re.sub(r"[^\w\s'!?.,-]", "", phrase)
-        if not phrase:
-            continue
-        start_t = fmt_time(group[0][1])
-        end_sec = min(group[-1][2] + 0.25, group[0][1] + 2.2)
-        end_t = fmt_time(max(end_sec, group[0][1] + 0.3))
-        lines.append(f"Dialogue: 0,{start_t},{end_t},Default,,0,0,0,,{phrase}")
-        transcript_parts.append(phrase)
+
+    try:
+        segments, _ = model.transcribe(clip_audio_path, word_timestamps=True, vad_filter=True)
+        words = []
+        for seg in segments:
+            if seg.words:
+                for w in seg.words:
+                    words.append((w.word.strip(), w.start, w.end))
+
+        chunk_size = 3
+        for i in range(0, len(words), chunk_size):
+            group = words[i : i + chunk_size]
+            phrase = " ".join(w[0] for w in group).upper()
+            phrase = re.sub(r"[^\w\s'!?.,-]", "", phrase)
+            if not phrase:
+                continue
+            start_t = fmt_time(group[0][1])
+            end_sec = min(group[-1][2] + 0.25, group[0][1] + 2.2)
+            end_t = fmt_time(max(end_sec, group[0][1] + 0.3))
+            lines.append(f"Dialogue: 0,{start_t},{end_t},Default,,0,0,0,,{phrase}")
+            transcript_parts.append(phrase)
+    except Exception as e:
+        print(f"Word-level alignment skipped ({e}); falling back to segment captions.")
+        try:
+            segments, _ = model.transcribe(clip_audio_path, word_timestamps=False, vad_filter=True)
+            for seg in segments:
+                phrase = re.sub(r"[^\w\s'!?.,-]", "", seg.text.strip().upper())
+                if phrase:
+                    lines.append(f"Dialogue: 0,{fmt_time(seg.start)},{fmt_time(seg.end)},Default,,0,0,0,,{phrase}")
+                    transcript_parts.append(phrase)
+        except Exception:
+            pass
 
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
