@@ -451,7 +451,7 @@ def make_viral_caption(streamer, transcript, clip_title="", is_gta6=False):
             f"Keep it completely safe for YouTube Community Guidelines (no sexual/explicit words or slurs). "
             f"End with {game_tag}#gaming #{name.lower()} #shorts. Return ONLY the single caption line."
         )
-        res = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        res = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
         hook = res.text.strip().splitlines()[0][:125]
         if hook and is_safe_text(hook):
             print(f"Generated unique AI caption: {hook}")
@@ -489,7 +489,7 @@ def publish_to_all_platforms(public_video_url, caption):
     mutation = """
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
-        ... on PostActionSuccess { post { id status } }
+        ... on PostActionSuccess { post { id status error { message } } }
         ... on MutationError { message }
       }
     }
