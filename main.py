@@ -25,10 +25,21 @@ STREAMERS = [
     {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "fallback_cam": "gta-left"},
     {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "fallback_cam": "mid-left"},
     {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams", "fallback_cam": "top-left"},
-    {"name": "IShowSpeed", "platform": "YouTube", "url": "ytsearch8:IShowSpeed stream clip", "fallback_cam": "top-left"},
+    {"name": "IShowSpeed", "platform": "YouTube", "url": "ytsearch8:IShowSpeed live stream clip", "fallback_cam": "top-left"},
 ]
 
 GTA6_KEYWORDS = ("gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi", "grand theft auto 6")
+
+UNSAFE_KEYWORDS = (
+    "pegging", "porn", "nsfw", "naked", "nude", "nudity", "sex", "sexual",
+    "strip club", "stripper", "onlyfans", "hentai", "blowjob", "handjob",
+    "erotic", "bdsm", "fetish", "slut", "whore", "rape", "suicide", "gore"
+)
+
+
+def is_safe_text(text):
+    lowered = text.lower()
+    return not any(re.search(rf"\b{re.escape(bad)}\b", lowered) for bad in UNSAFE_KEYWORDS)
 
 
 def is_gta6_entry(entry):
@@ -48,10 +59,11 @@ def load_history():
                 data = json.load(f)
                 data.setdefault("posted_ids", [])
                 data.setdefault("last_streamer", "")
+                data.setdefault("last_platform", "")
                 return data
         except Exception:
             pass
-    return {"posted_ids": [], "last_streamer": ""}
+    return {"posted_ids": [], "last_streamer": "", "last_platform": ""}
 
 
 def save_history(history):
@@ -63,20 +75,24 @@ def save_history(history):
 def collect_viral_candidates(streamers, history):
     candidates = []
     last_streamer = history.get("last_streamer", "")
+    last_platform = history.get("last_platform", "")
 
     for streamer in streamers:
         url = streamer["url"]
-        print(f"Scanning {streamer['name']} ({url})...")
+        print(f"Scanning {streamer['name']} [{streamer['platform']}] ({url})...")
+        probe_cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "15"]
+        if streamer["platform"] == "YouTube":
+            probe_cmd.extend(["--extractor-args", "youtube:player_client=android,ios"])
+        probe_cmd.append(url)
+
         try:
-            probe = subprocess.run(
-                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "20", url],
-                capture_output=True, text=True, timeout=45
-            )
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=45)
         except subprocess.TimeoutExpired:
             print(f"Probe timed out for {streamer['name']}, skipping...")
             continue
 
         if probe.returncode != 0 or not probe.stdout.strip():
+            print(f"Probe returned empty for {streamer['name']}: {probe.stderr[-180:]}")
             continue
 
         try:
@@ -87,11 +103,15 @@ def collect_viral_candidates(streamers, history):
                     continue
                 t_url = entry.get("webpage_url") or entry.get("url")
                 v_id = entry.get("id")
+                title = entry.get("title", "")
                 if not t_url or not v_id:
                     continue
 
+                if not is_safe_text(title):
+                    print(f"Skipping unsafe title for YouTube TOS: {title[:60]}")
+                    continue
+
                 is_live = (entry.get("live_status") == "is_live")
-                # Allow slicing different segments of an active livestream using time-bucketed IDs
                 history_id = f"{v_id}_{int(time.time() // 3600)}" if is_live else v_id
                 if history_id in history["posted_ids"]:
                     continue
@@ -100,10 +120,10 @@ def collect_viral_candidates(streamers, history):
                     t_url = f"https://www.youtube.com/watch?v={v_id}"
 
                 raw_views = int(entry.get("view_count") or 0)
-                # Give YouTube /streams entries (which often hide view_count in flat-playlist) a fair baseline
-                views = raw_views if raw_views > 0 else (2500 if is_live else 1200)
+                views = raw_views if raw_views > 0 else (8000 if is_live else 4000)
                 gta6_match = is_gta6_entry(entry)
                 is_different_creator = (streamer["name"] != last_streamer)
+                is_different_platform = (streamer["platform"] != last_platform)
 
                 candidates.append({
                     "streamer": streamer,
@@ -113,7 +133,8 @@ def collect_viral_candidates(streamers, history):
                     "is_live": is_live,
                     "is_gta6": gta6_match,
                     "different_creator": is_different_creator,
-                    "title": entry.get("title", ""),
+                    "different_platform": is_different_platform,
+                    "title": title,
                 })
         except Exception as e:
             print(f"Parse warning for {streamer['name']}: {e}")
@@ -121,11 +142,12 @@ def collect_viral_candidates(streamers, history):
     for c in candidates:
         c["weighted_views"] = c["views"] * random.uniform(0.85, 1.15)
 
+    # Alternate Twitch <-> YouTube so IShowSpeed gets equal airtime alongside Twitch streamers
     candidates.sort(
-        key=lambda c: (c["is_gta6"], c["different_creator"], c["weighted_views"]),
+        key=lambda c: (c["is_gta6"], c["different_platform"], c["different_creator"], c["weighted_views"]),
         reverse=True
     )
-    print(f"Total unposted candidates found: {len(candidates)}")
+    print(f"Total safe unposted candidates found: {len(candidates)}")
     return candidates
 
 
@@ -135,10 +157,13 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
 
     target_url = candidate["url"]
     name = candidate["streamer"]["name"]
+    platform = candidate["streamer"]["platform"]
     is_live = candidate.get("is_live", False)
-    print(f"Downloading candidate: {name} | {candidate['views']:,} views | Live={is_live} | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
+    print(f"Downloading candidate: {name} [{platform}] | {candidate['views']:,} views | Live={is_live} | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
 
     is_twitch_clip = "twitch.tv" in target_url and "/clip/" in target_url
+    yt_bypass = ["--extractor-args", "youtube:player_client=android,ios"] if platform == "YouTube" else []
+
     if is_twitch_clip:
         cmd = [
             "yt-dlp", "--no-playlist",
@@ -147,9 +172,9 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
             "-o", raw_output, target_url
         ]
     elif is_live:
-        # Grab a 90-second slice from an active YouTube livestream (like IShowSpeed)
         cmd = [
             "yt-dlp", "--no-playlist",
+            *yt_bypass,
             "--live-from-start",
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
@@ -157,12 +182,12 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
             "-o", raw_output, target_url
         ]
     else:
-        # Pick a random 2-minute window past the intro screen for full YouTube stream VODs
-        start_min = random.randint(20, 65)
+        start_min = random.randint(15, 55)
         end_min = start_min + 2
-        section = f"*00:{start_min:02d}:00-00:{end_min:02d}:00" if end_min < 60 else f"*00:{start_min:02d}:00-01:{end_min-60:02d}:00"
+        section = f"*00:{start_min:02d}:00-00:{end_min:02d}:00"
         cmd = [
             "yt-dlp", "--no-playlist",
+            *yt_bypass,
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
             "--download-sections", section,
@@ -180,7 +205,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
                 print(f"Skipping vertical/pre-edited clip ({w}x{h}) for {name}...")
                 return None
             return raw_output
-        print(f"Download failed for {name}: {res.stderr[-250:]}")
+        print(f"Download failed for {name}: {res.stderr[-300:]}")
     except subprocess.TimeoutExpired:
         print(f"Download timed out for {name}")
         if os.path.exists(raw_output):
@@ -306,9 +331,9 @@ def detect_facecam_box(video_path):
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
-        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
+        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.10, minNeighbors=5, minSize=(36, 36)))
         if not faces and not profile.empty():
-            faces = list(profile.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
+            faces = list(profile.detectMultiScale(gray, scaleFactor=1.10, minNeighbors=5, minSize=(36, 36)))
 
         for (fx, fy, fw, fh) in faces:
             cx, cy = fx + fw / 2.0, fy + fh / 2.0
@@ -316,7 +341,7 @@ def detect_facecam_box(video_path):
                 detections.append((cx, cy))
     cap.release()
 
-    if not detections:
+    if len(detections) < 2:
         return None
 
     med_cx = float(np.median([d[0] for d in detections]))
@@ -329,7 +354,7 @@ def detect_facecam_box(video_path):
     return f"crop={crop_w}:{crop_h}:{x0}:{y0}"
 
 
-def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
+def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp4"):
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -341,21 +366,10 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
         capture_output=True, check=True
     )
 
-    cam_crops = {
-        "top-left": "crop=iw*0.24:ih*0.26:0:0",
-        "mid-left": "crop=iw*0.24:ih*0.26:0:ih*0.18",
-        "gta-left": "crop=iw*0.23:ih*0.25:0:ih*0.49",
-        "top-right": "crop=iw*0.24:ih*0.26:iw*0.76:0",
-        "bottom-left": "crop=iw*0.24:ih*0.26:0:ih*0.72",
-        "bottom-right": "crop=iw*0.24:ih*0.26:iw*0.76:ih*0.72",
-    }
-
     cam_crop = detect_facecam_box(trimmed)
-    if cam_crop:
-        print(f"Facecam locked via OpenCV: {cam_crop}")
-    else:
-        cam_crop = cam_crops.get(fallback_cam, cam_crops["top-left"])
-        print(f"Using streamer calibrated facecam box ({fallback_cam}): {cam_crop}")
+    if not cam_crop:
+        print("No confirmed streamer facecam detected — skipping clip to avoid blank wall crops.")
+        return None, None
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", trimmed, "-ac", "1", "-ar", "16000", clip_wav],
@@ -363,6 +377,11 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
     )
     ass_file, transcript = generate_word_subtitles(clip_wav)
 
+    if not is_safe_text(transcript):
+        print("Transcript triggered YouTube safety filter — skipping clip.")
+        return None, None
+
+    print(f"Facecam locked via OpenCV: {cam_crop}")
     filter_complex = (
         f"[0:v]{cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
         f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
@@ -391,7 +410,7 @@ def make_viral_caption(streamer, transcript, clip_title="", is_gta6=False):
     credit_line = f"Credit: @{name} on {platform}"
 
     clean_clip_title = re.sub(r"[^\w\s'!?.,-]", "", clip_title).strip()
-    if clean_clip_title and len(clean_clip_title) > 4:
+    if clean_clip_title and len(clean_clip_title) > 4 and is_safe_text(clean_clip_title):
         fallback_hook = f"{clean_clip_title[:65]} ({name}) 💀 {game_tag}#gaming #{name.lower()} #shorts"
     else:
         fallback_hook = f"{name} couldn't believe what just happened 💀 {game_tag}#gaming #{name.lower()} #shorts"
@@ -404,15 +423,14 @@ def make_viral_caption(streamer, transcript, clip_title="", is_gta6=False):
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
-            f"Write a unique, punchy, viral 1-sentence YouTube Shorts title/caption (under 75 chars) about this specific clip of {name}. "
-            f"Original clip title: '{clean_clip_title}'. "
-            f"Spoken dialogue: '{transcript[:280]}'. "
-            f"Make it specific to what happened in the clip—never use generic phrases like 'reaction is unreal'. "
+            f"Write a unique, advertiser-friendly, viral 1-sentence YouTube Shorts title (under 75 chars) about this gaming clip of {name}. "
+            f"Context: '{clean_clip_title}'. Dialogue: '{transcript[:280]}'. "
+            f"Keep it completely safe for YouTube Community Guidelines (no sexual/explicit words or slurs). "
             f"End with {game_tag}#gaming #{name.lower()} #shorts. Return ONLY the single caption line."
         )
         res = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
         hook = res.text.strip().splitlines()[0][:125]
-        if hook:
+        if hook and is_safe_text(hook):
             print(f"Generated unique AI caption: {hook}")
             return f"{hook}\n\n{credit_line}"
     except Exception as e:
@@ -504,7 +522,12 @@ if __name__ == "__main__":
 
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
-        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["fallback_cam"])
+        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur)
+        if not final_clip:
+            history["posted_ids"].append(candidate["id"])
+            save_history(history)
+            continue
+
         caption = make_viral_caption(
             streamer,
             transcript,
@@ -517,6 +540,7 @@ if __name__ == "__main__":
             publish_to_all_platforms(upload["secure_url"], caption)
             history["posted_ids"].append(candidate["id"])
             history["last_streamer"] = streamer["name"]
+            history["last_platform"] = streamer["platform"]
             save_history(history)
             time.sleep(90)
         finally:
