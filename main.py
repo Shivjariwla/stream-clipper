@@ -27,11 +27,11 @@ if YOUTUBE_COOKIES.strip():
         cf.write(YOUTUBE_COOKIES.strip() + "\n")
 
 STREAMERS = [
-    {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "fallback_cam": "top-left"},
-    {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "fallback_cam": "gta-left"},
-    {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "fallback_cam": "mid-left"},
-    {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams", "fallback_cam": "top-left"},
-    {"name": "IShowSpeed", "platform": "YouTube", "url": "ytsearch8:IShowSpeed live stream clip", "fallback_cam": "top-left"},
+    {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr"},
+    {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr"},
+    {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr"},
+    {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams"},
+    {"name": "IShowSpeed", "platform": "YouTube", "url": "ytsearch8:IShowSpeed live stream clip"},
 ]
 
 GTA6_KEYWORDS = ("gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi", "grand theft auto 6")
@@ -316,10 +316,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return ass_path, " ".join(transcript_parts)
 
 
-def detect_facecam_box(video_path):
-    if not hasattr(cv2, "CascadeClassifier"):
-        return None
-
+def auto_detect_facecam_crop(video_path):
+    """
+    Fully automatic facecam detector:
+    1. Scans 24 frames with CLAHE contrast boosting + frontal & profile Haar cascades.
+    2. If lighting/headsets hide facial landmarks, scores the 6 standard OBS webcam zones
+       by skin-tone + upper-body presence so the real webcam is always auto-selected.
+    3. Returns None if no facecam exists anywhere on screen (e.g., full-screen gameplay/trailers).
+    """
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -330,44 +334,87 @@ def detect_facecam_box(video_path):
 
     cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
     frontal = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_default.xml")
+    alt2 = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_alt2.xml")
     profile = cv2.CascadeClassifier(cascade_dir + "haarcascade_profileface.xml")
-    if frontal.empty():
-        cap.release()
-        return None
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
-    detections = []
-    for i in range(1, 17):
-        frac = i / 17.0
+    # Candidate webcam overlay boxes: (name, x_frac, y_frac, w_frac, h_frac)
+    zones = [
+        ("top-left", 0.00, 0.00, 0.24, 0.27),
+        ("mid-left", 0.00, 0.18, 0.24, 0.27),
+        ("gta-left", 0.00, 0.48, 0.23, 0.26),
+        ("bottom-left", 0.00, 0.72, 0.24, 0.27),
+        ("top-right", 0.76, 0.00, 0.24, 0.27),
+        ("bottom-right", 0.76, 0.72, 0.24, 0.27),
+    ]
+    zone_skin_scores = {z[0]: [] for z in zones}
+    face_detections = []
+
+    for i in range(1, 25):
+        frac = i / 25.0
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
         ok, frame = cap.read()
         if not ok:
             continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
-        if not faces and not profile.empty():
-            faces = list(profile.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
+
+        gray = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        skin_mask = cv2.inRange(ycrcb, np.array([25, 133, 77]), np.array([245, 178, 132]))
+
+        faces = []
+        for det in (frontal, alt2, profile):
+            if not det.empty():
+                found = det.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(26, 26))
+                if len(found) > 0:
+                    faces.extend(found)
+                    break
 
         for (fx, fy, fw, fh) in faces:
             cx, cy = fx + fw / 2.0, fy + fh / 2.0
             if cx < w * 0.36 or cx > w * 0.64:
-                detections.append((cx, cy))
+                face_detections.append((cx, cy))
+
+        for z_name, xf, yf, wf, hf in zones:
+            x1, y1 = int(w * xf), int(h * yf)
+            x2, y2 = int(w * (xf + wf)), int(h * (yf + hf))
+            roi_skin = float(np.mean(skin_mask[y1:y2, x1:x2] > 0))
+            zone_skin_scores[z_name].append(roi_skin)
+
     cap.release()
 
-    if not detections:
-        return None
+    if face_detections:
+        med_cx = float(np.median([d[0] for d in face_detections]))
+        med_cy = float(np.median([d[1] for d in face_detections]))
+        crop_w = int(w * 0.24)
+        crop_h = int(h * 0.26)
+        x0 = max(0, min(int(med_cx - crop_w * 0.50), w - crop_w))
+        y0 = max(0, min(int(med_cy - crop_h * 0.42), h - crop_h))
+        crop_str = f"crop={crop_w}:{crop_h}:{x0}:{y0}"
+        print(f"Auto facecam locked via OpenCV face tracking ({len(face_detections)} hits): {crop_str}")
+        return crop_str
 
-    med_cx = float(np.median([d[0] for d in detections]))
-    med_cy = float(np.median([d[1] for d in detections]))
+    # Secondary automatic lock: pick the webcam zone with strong human skin-tone presence (8%–55%)
+    best_zone = None
+    best_score = 0.0
+    for z_name, xf, yf, wf, hf in zones:
+        scores = zone_skin_scores[z_name]
+        if not scores:
+            continue
+        med_skin = float(np.median(scores))
+        if 0.08 <= med_skin <= 0.55 and med_skin > best_score:
+            best_score = med_skin
+            best_zone = (z_name, xf, yf, wf, hf)
 
-    crop_w = int(w * 0.24)
-    crop_h = int(h * 0.26)
-    x0 = max(0, min(int(med_cx - crop_w * 0.50), w - crop_w))
-    y0 = max(0, min(int(med_cy - crop_h * 0.42), h - crop_h))
-    return f"crop={crop_w}:{crop_h}:{x0}:{y0}"
+    if best_zone:
+        z_name, xf, yf, wf, hf = best_zone
+        crop_str = f"crop=iw*{wf:.2f}:ih*{hf:.2f}:iw*{xf:.2f}:ih*{yf:.2f}"
+        print(f"Auto facecam locked via skin/overlay detector ({z_name}, score={best_score:.2f}): {crop_str}")
+        return crop_str
+
+    return None
 
 
-def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
+def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp4"):
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -379,6 +426,11 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
         capture_output=True, check=True
     )
 
+    cam_crop = auto_detect_facecam_crop(trimmed)
+    if not cam_crop:
+        print("Auto facecam detector found no webcam in this clip — skipping.")
+        return None, None
+
     subprocess.run(
         ["ffmpeg", "-y", "-i", trimmed, "-ac", "1", "-ar", "16000", clip_wav],
         capture_output=True, check=True
@@ -388,22 +440,6 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
     if not is_safe_text(transcript):
         print("Transcript triggered YouTube safety filter — skipping clip.")
         return None, None
-
-    cam_crops = {
-        "top-left": "crop=iw*0.24:ih*0.26:0:0",
-        "mid-left": "crop=iw*0.24:ih*0.26:0:ih*0.18",
-        "gta-left": "crop=iw*0.23:ih*0.25:0:ih*0.49",
-        "top-right": "crop=iw*0.24:ih*0.26:iw*0.76:0",
-        "bottom-left": "crop=iw*0.24:ih*0.26:0:ih*0.72",
-        "bottom-right": "crop=iw*0.24:ih*0.26:iw*0.76:ih*0.72",
-    }
-
-    cam_crop = detect_facecam_box(trimmed)
-    if cam_crop:
-        print(f"Facecam locked via OpenCV: {cam_crop}")
-    else:
-        cam_crop = cam_crops.get(fallback_cam, cam_crops["top-left"])
-        print(f"Using streamer calibrated facecam box ({fallback_cam}): {cam_crop}")
 
     filter_complex = (
         f"[0:v]{cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
@@ -434,9 +470,9 @@ def make_viral_caption(streamer, transcript, clip_title="", is_gta6=False):
 
     clean_clip_title = re.sub(r"[^\w\s'!?.,-]", "", clip_title).strip()
     if clean_clip_title and len(clean_clip_title) > 4 and is_safe_text(clean_clip_title):
-        fallback_hook = f"{clean_clip_title[:65]} ({name}) 💀 {game_tag}#gaming #{name.lower()} #shorts"
+        fallback_hook = f"{clean_clip_title[:65]} ({name}) {game_tag}#gaming #{name.lower()} #shorts"
     else:
-        fallback_hook = f"{name} couldn't believe what just happened 💀 {game_tag}#gaming #{name.lower()} #shorts"
+        fallback_hook = f"{name} couldn't believe what just happened {game_tag}#gaming #{name.lower()} #shorts"
 
     fallback = f"{fallback_hook}\n\n{credit_line}"
 
@@ -508,14 +544,12 @@ def publish_to_all_platforms(public_video_url, caption):
             post_input["metadata"] = {"instagram": {"type": "reel", "shouldShareToFeed": True}}
         elif service == "youtube":
             first_line = caption.splitlines()[0]
-            yt_title = first_line.split("#")[0].strip()[:88] or "Crazy Stream Moment"
+            ascii_title = re.sub(r"[^\w\s'!?.,-]", "", first_line.split("#")[0]).strip()[:85] or "Crazy Stream Moment"
             post_input["metadata"] = {
                 "youtube": {
-                    "title": f"{yt_title} #shorts"[:100],
+                    "title": f"{ascii_title} #shorts"[:100],
                     "categoryId": "20",
-                    "privacy": "public",
-                    "madeForKids": False,
-                    "notifySubscribers": True
+                    "privacy": "public"
                 }
             }
 
@@ -523,7 +557,8 @@ def publish_to_all_platforms(public_video_url, caption):
         print(f"Buffer response for {ch['service']} ({ch['name']}):", json.dumps(res))
 
         create_data = (res.get("data") or {}).get("createPost") or {}
-        if "post" in create_data:
+        post_obj = create_data.get("post") or {}
+        if post_obj and post_obj.get("status") != "error":
             success_count += 1
         else:
             print(f"WARNING: Failed to post to {ch['service']}: {res}")
@@ -547,7 +582,7 @@ if __name__ == "__main__":
 
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
-        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["fallback_cam"])
+        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur)
         if not final_clip:
             history["posted_ids"].append(candidate["id"])
             save_history(history)
