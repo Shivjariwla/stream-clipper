@@ -20,7 +20,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg nodejs
 
       - run: |
-          pip install -U yt-dlp faster-whisper numpy requests cloudinary google-genai
+          pip install -U "yt-dlp[default]" faster-whisper numpy requests cloudinary google-genai
           pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless || true
           pip install --no-cache-dir opencv-python-headless
 
