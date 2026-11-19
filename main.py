@@ -318,11 +318,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def auto_detect_facecam_crop(video_path):
     """
-    Fully automatic facecam detector:
-    1. Scans 24 frames with CLAHE contrast boosting + frontal & profile Haar cascades.
-    2. If lighting/headsets hide facial landmarks, scores the 6 standard OBS webcam zones
-       by skin-tone + upper-body presence so the real webcam is always auto-selected.
-    3. Returns None if no facecam exists anywhere on screen (e.g., full-screen gameplay/trailers).
+    Fully automatic facecam detector compatible with OpenCV 4.x & 5.x headless:
+    1. Uses Haar cascades when exposed by cv2.CascadeClassifier.
+    2. Scores the 6 standard OBS webcam overlay zones across 24 frames using
+       YCrCb human skin-tone + temporal motion/static-border consistency.
     """
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -332,13 +331,20 @@ def auto_detect_facecam_crop(video_path):
         cap.release()
         return None
 
-    cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
-    frontal = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_default.xml")
-    alt2 = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_alt2.xml")
-    profile = cv2.CascadeClassifier(cascade_dir + "haarcascade_profileface.xml")
+    cascades = []
+    if hasattr(cv2, "CascadeClassifier"):
+        cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
+        for xml_name in (
+            "haarcascade_frontalface_default.xml",
+            "haarcascade_frontalface_alt2.xml",
+            "haarcascade_profileface.xml",
+        ):
+            clf = cv2.CascadeClassifier(cascade_dir + xml_name)
+            if not clf.empty():
+                cascades.append(clf)
+
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
-    # Candidate webcam overlay boxes: (name, x_frac, y_frac, w_frac, h_frac)
     zones = [
         ("top-left", 0.00, 0.00, 0.24, 0.27),
         ("mid-left", 0.00, 0.18, 0.24, 0.27),
@@ -357,22 +363,19 @@ def auto_detect_facecam_crop(video_path):
         if not ok:
             continue
 
-        gray = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-        skin_mask = cv2.inRange(ycrcb, np.array([25, 133, 77]), np.array([245, 178, 132]))
-
-        faces = []
-        for det in (frontal, alt2, profile):
-            if not det.empty():
+        if cascades:
+            gray = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            for det in cascades:
                 found = det.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(26, 26))
                 if len(found) > 0:
-                    faces.extend(found)
+                    for (fx, fy, fw, fh) in found:
+                        cx, cy = fx + fw / 2.0, fy + fh / 2.0
+                        if cx < w * 0.36 or cx > w * 0.64:
+                            face_detections.append((cx, cy))
                     break
 
-        for (fx, fy, fw, fh) in faces:
-            cx, cy = fx + fw / 2.0, fy + fh / 2.0
-            if cx < w * 0.36 or cx > w * 0.64:
-                face_detections.append((cx, cy))
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        skin_mask = cv2.inRange(ycrcb, np.array([25, 133, 77]), np.array([245, 178, 132]))
 
         for z_name, xf, yf, wf, hf in zones:
             x1, y1 = int(w * xf), int(h * yf)
@@ -393,7 +396,6 @@ def auto_detect_facecam_crop(video_path):
         print(f"Auto facecam locked via OpenCV face tracking ({len(face_detections)} hits): {crop_str}")
         return crop_str
 
-    # Secondary automatic lock: pick the webcam zone with strong human skin-tone presence (8%–55%)
     best_zone = None
     best_score = 0.0
     for z_name, xf, yf, wf, hf in zones:
@@ -401,7 +403,7 @@ def auto_detect_facecam_crop(video_path):
         if not scores:
             continue
         med_skin = float(np.median(scores))
-        if 0.08 <= med_skin <= 0.55 and med_skin > best_score:
+        if 0.06 <= med_skin <= 0.60 and med_skin > best_score:
             best_score = med_skin
             best_zone = (z_name, xf, yf, wf, hf)
 
