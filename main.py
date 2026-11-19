@@ -16,9 +16,15 @@ from google import genai
 CLOUDINARY_URL = os.environ["CLOUDINARY_URL"]
 BUFFER_ACCESS_TOKEN = os.environ["BUFFER_ACCESS_TOKEN"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
+COOKIES_FILE = "cookies.txt"
 HISTORY_FILE = "posted_history.json"
 
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
+
+if YOUTUBE_COOKIES.strip():
+    with open(COOKIES_FILE, "w", encoding="utf-8") as cf:
+        cf.write(YOUTUBE_COOKIES.strip() + "\n")
 
 STREAMERS = [
     {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr", "fallback_cam": "top-left"},
@@ -35,6 +41,15 @@ UNSAFE_KEYWORDS = (
     "strip club", "stripper", "onlyfans", "hentai", "blowjob", "handjob",
     "erotic", "bdsm", "fetish", "slut", "whore", "rape", "suicide", "gore"
 )
+
+
+def yt_auth_args():
+    args = ["--js-runtimes", "node"]
+    if os.path.exists(COOKIES_FILE):
+        args.extend(["--cookies", COOKIES_FILE])
+    else:
+        args.extend(["--extractor-args", "youtube:player_client=android,ios"])
+    return args
 
 
 def is_safe_text(text):
@@ -82,7 +97,7 @@ def collect_viral_candidates(streamers, history):
         print(f"Scanning {streamer['name']} [{streamer['platform']}] ({url})...")
         probe_cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "15"]
         if streamer["platform"] == "YouTube":
-            probe_cmd.extend(["--extractor-args", "youtube:player_client=android,ios"])
+            probe_cmd.extend(yt_auth_args())
         probe_cmd.append(url)
 
         try:
@@ -142,7 +157,6 @@ def collect_viral_candidates(streamers, history):
     for c in candidates:
         c["weighted_views"] = c["views"] * random.uniform(0.85, 1.15)
 
-    # Alternate Twitch <-> YouTube so IShowSpeed gets equal airtime alongside Twitch streamers
     candidates.sort(
         key=lambda c: (c["is_gta6"], c["different_platform"], c["different_creator"], c["weighted_views"]),
         reverse=True
@@ -162,7 +176,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
     print(f"Downloading candidate: {name} [{platform}] | {candidate['views']:,} views | Live={is_live} | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
 
     is_twitch_clip = "twitch.tv" in target_url and "/clip/" in target_url
-    yt_bypass = ["--extractor-args", "youtube:player_client=android,ios"] if platform == "YouTube" else []
+    yt_flags = yt_auth_args() if platform == "YouTube" else []
 
     if is_twitch_clip:
         cmd = [
@@ -174,7 +188,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
     elif is_live:
         cmd = [
             "yt-dlp", "--no-playlist",
-            *yt_bypass,
+            *yt_flags,
             "--live-from-start",
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
@@ -187,7 +201,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
         section = f"*00:{start_min:02d}:00-00:{end_min:02d}:00"
         cmd = [
             "yt-dlp", "--no-playlist",
-            *yt_bypass,
+            *yt_flags,
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
             "--download-sections", section,
@@ -203,9 +217,9 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
             cap.release()
             if w <= h:
                 print(f"Skipping vertical/pre-edited clip ({w}x{h}) for {name}...")
-                return None
+                return "skip_permanently"
             return raw_output
-        print(f"Download failed for {name}: {res.stderr[-300:]}")
+        print(f"Download failed for {name}: {res.stderr[-250:]}")
     except subprocess.TimeoutExpired:
         print(f"Download timed out for {name}")
         if os.path.exists(raw_output):
@@ -515,9 +529,11 @@ if __name__ == "__main__":
 
     for candidate in candidates:
         raw_file = download_candidate(candidate)
-        if not raw_file:
+        if raw_file == "skip_permanently":
             history["posted_ids"].append(candidate["id"])
             save_history(history)
+            continue
+        if not raw_file:
             continue
 
         streamer = candidate["streamer"]
