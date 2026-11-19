@@ -25,6 +25,7 @@ STREAMERS = [
     {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr", "fallback_cam": "gta-left"},
     {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr", "fallback_cam": "mid-left"},
     {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams", "fallback_cam": "top-left"},
+    {"name": "IShowSpeed", "platform": "YouTube", "url": "ytsearch8:IShowSpeed stream clip", "fallback_cam": "top-left"},
 ]
 
 GTA6_KEYWORDS = ("gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi", "grand theft auto 6")
@@ -68,7 +69,7 @@ def collect_viral_candidates(streamers, history):
         print(f"Scanning {streamer['name']} ({url})...")
         try:
             probe = subprocess.run(
-                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "25", url],
+                ["yt-dlp", "--flat-playlist", "--dump-single-json", "--playlist-end", "20", url],
                 capture_output=True, text=True, timeout=45
             )
         except subprocess.TimeoutExpired:
@@ -86,18 +87,30 @@ def collect_viral_candidates(streamers, history):
                     continue
                 t_url = entry.get("webpage_url") or entry.get("url")
                 v_id = entry.get("id")
-                if not t_url or not v_id or v_id in history["posted_ids"]:
+                if not t_url or not v_id:
                     continue
 
-                views = int(entry.get("view_count") or 0)
+                is_live = (entry.get("live_status") == "is_live")
+                # Allow slicing different segments of an active livestream using time-bucketed IDs
+                history_id = f"{v_id}_{int(time.time() // 3600)}" if is_live else v_id
+                if history_id in history["posted_ids"]:
+                    continue
+
+                if t_url.startswith("/") or not t_url.startswith("http"):
+                    t_url = f"https://www.youtube.com/watch?v={v_id}"
+
+                raw_views = int(entry.get("view_count") or 0)
+                # Give YouTube /streams entries (which often hide view_count in flat-playlist) a fair baseline
+                views = raw_views if raw_views > 0 else (2500 if is_live else 1200)
                 gta6_match = is_gta6_entry(entry)
                 is_different_creator = (streamer["name"] != last_streamer)
 
                 candidates.append({
                     "streamer": streamer,
                     "url": t_url,
-                    "id": v_id,
+                    "id": history_id,
                     "views": views,
+                    "is_live": is_live,
                     "is_gta6": gta6_match,
                     "different_creator": is_different_creator,
                     "title": entry.get("title", ""),
@@ -122,7 +135,8 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
 
     target_url = candidate["url"]
     name = candidate["streamer"]["name"]
-    print(f"Downloading candidate: {name} | {candidate['views']:,} views | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
+    is_live = candidate.get("is_live", False)
+    print(f"Downloading candidate: {name} | {candidate['views']:,} views | Live={is_live} | GTA6={candidate['is_gta6']} | {candidate['title'][:60]}")
 
     is_twitch_clip = "twitch.tv" in target_url and "/clip/" in target_url
     if is_twitch_clip:
@@ -132,17 +146,31 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
             "--merge-output-format", "mp4",
             "-o", raw_output, target_url
         ]
+    elif is_live:
+        # Grab a 90-second slice from an active YouTube livestream (like IShowSpeed)
+        cmd = [
+            "yt-dlp", "--no-playlist",
+            "--live-from-start",
+            "-f", "bv*[height<=720]+ba/b[height<=720]/best",
+            "--merge-output-format", "mp4",
+            "--download-sections", "*00:10:00-00:11:30",
+            "-o", raw_output, target_url
+        ]
     else:
+        # Pick a random 2-minute window past the intro screen for full YouTube stream VODs
+        start_min = random.randint(20, 65)
+        end_min = start_min + 2
+        section = f"*00:{start_min:02d}:00-00:{end_min:02d}:00" if end_min < 60 else f"*00:{start_min:02d}:00-01:{end_min-60:02d}:00"
         cmd = [
             "yt-dlp", "--no-playlist",
             "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
-            "--download-sections", "*00:15:00-00:17:00",
+            "--download-sections", section,
             "-o", raw_output, target_url
         ]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=150)
         if os.path.exists(raw_output) and os.path.getsize(raw_output) > 250_000:
             cap = cv2.VideoCapture(raw_output)
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -294,7 +322,6 @@ def detect_facecam_box(video_path):
     med_cx = float(np.median([d[0] for d in detections]))
     med_cy = float(np.median([d[1] for d in detections]))
 
-    # Tighter webcam framing centered slightly above the face center so the head/shoulders fill the top box cleanly
     crop_w = int(w * 0.24)
     crop_h = int(h * 0.26)
     x0 = max(0, min(int(med_cx - crop_w * 0.50), w - crop_w))
@@ -314,7 +341,6 @@ def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path=
         capture_output=True, check=True
     )
 
-    # Calibrated webcam boxes for each streamer's OBS overlay position
     cam_crops = {
         "top-left": "crop=iw*0.24:ih*0.26:0:0",
         "mid-left": "crop=iw*0.24:ih*0.26:0:ih*0.18",
