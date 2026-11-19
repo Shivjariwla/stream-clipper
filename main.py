@@ -44,11 +44,9 @@ UNSAFE_KEYWORDS = (
 
 
 def yt_auth_args():
-    args = ["--js-runtimes", "node"]
+    args = ["--js-runtimes", "node", "--remote-components", "ejs:github"]
     if os.path.exists(COOKIES_FILE):
         args.extend(["--cookies", COOKIES_FILE])
-    else:
-        args.extend(["--extractor-args", "youtube:player_client=android,ios"])
     return args
 
 
@@ -190,7 +188,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
             "yt-dlp", "--no-playlist",
             *yt_flags,
             "--live-from-start",
-            "-f", "bv*[height<=720]+ba/b[height<=720]/best",
+            "-f", "bv*[height<=720]+ba/b[height<=720]/b/best",
             "--merge-output-format", "mp4",
             "--download-sections", "*00:10:00-00:11:30",
             "-o", raw_output, target_url
@@ -202,7 +200,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
         cmd = [
             "yt-dlp", "--no-playlist",
             *yt_flags,
-            "-f", "bv*[height<=720]+ba/b[height<=720]/best",
+            "-f", "bv*[height<=720]+ba/b[height<=720]/b/best",
             "--merge-output-format", "mp4",
             "--download-sections", section,
             "-o", raw_output, target_url
@@ -338,24 +336,25 @@ def detect_facecam_box(video_path):
         return None
 
     detections = []
-    for frac in (0.08, 0.20, 0.32, 0.44, 0.56, 0.68, 0.80, 0.92):
+    for i in range(1, 17):
+        frac = i / 17.0
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
         ok, frame = cap.read()
         if not ok:
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
-        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.10, minNeighbors=5, minSize=(36, 36)))
+        faces = list(frontal.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
         if not faces and not profile.empty():
-            faces = list(profile.detectMultiScale(gray, scaleFactor=1.10, minNeighbors=5, minSize=(36, 36)))
+            faces = list(profile.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(28, 28)))
 
         for (fx, fy, fw, fh) in faces:
             cx, cy = fx + fw / 2.0, fy + fh / 2.0
-            if cx < w * 0.35 or cx > w * 0.65:
+            if cx < w * 0.36 or cx > w * 0.64:
                 detections.append((cx, cy))
     cap.release()
 
-    if len(detections) < 2:
+    if not detections:
         return None
 
     med_cx = float(np.median([d[0] for d in detections]))
@@ -368,7 +367,7 @@ def detect_facecam_box(video_path):
     return f"crop={crop_w}:{crop_h}:{x0}:{y0}"
 
 
-def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp4"):
+def render_split_clip(raw_video, start_sec, duration, fallback_cam, output_path="final_clip.mp4"):
     trimmed = "trimmed.mp4"
     clip_wav = "clip_voice.wav"
 
@@ -380,11 +379,6 @@ def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp
         capture_output=True, check=True
     )
 
-    cam_crop = detect_facecam_box(trimmed)
-    if not cam_crop:
-        print("No confirmed streamer facecam detected — skipping clip to avoid blank wall crops.")
-        return None, None
-
     subprocess.run(
         ["ffmpeg", "-y", "-i", trimmed, "-ac", "1", "-ar", "16000", clip_wav],
         capture_output=True, check=True
@@ -395,7 +389,22 @@ def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp
         print("Transcript triggered YouTube safety filter — skipping clip.")
         return None, None
 
-    print(f"Facecam locked via OpenCV: {cam_crop}")
+    cam_crops = {
+        "top-left": "crop=iw*0.24:ih*0.26:0:0",
+        "mid-left": "crop=iw*0.24:ih*0.26:0:ih*0.18",
+        "gta-left": "crop=iw*0.23:ih*0.25:0:ih*0.49",
+        "top-right": "crop=iw*0.24:ih*0.26:iw*0.76:0",
+        "bottom-left": "crop=iw*0.24:ih*0.26:0:ih*0.72",
+        "bottom-right": "crop=iw*0.24:ih*0.26:iw*0.76:ih*0.72",
+    }
+
+    cam_crop = detect_facecam_box(trimmed)
+    if cam_crop:
+        print(f"Facecam locked via OpenCV: {cam_crop}")
+    else:
+        cam_crop = cam_crops.get(fallback_cam, cam_crops["top-left"])
+        print(f"Using streamer calibrated facecam box ({fallback_cam}): {cam_crop}")
+
     filter_complex = (
         f"[0:v]{cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
         f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
@@ -538,7 +547,7 @@ if __name__ == "__main__":
 
         streamer = candidate["streamer"]
         start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
-        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur)
+        final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur, streamer["fallback_cam"])
         if not final_clip:
             history["posted_ids"].append(candidate["id"])
             save_history(history)
