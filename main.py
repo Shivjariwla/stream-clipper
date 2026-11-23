@@ -318,10 +318,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def auto_detect_facecam_crop(video_path):
     """
-    Fully automatic facecam detector compatible with OpenCV 4.x & 5.x headless:
-    1. Uses Haar cascades when exposed by cv2.CascadeClassifier.
-    2. Scores the 6 standard OBS webcam overlay zones across 24 frames using
-       YCrCb human skin-tone + temporal motion/static-border consistency.
+    True OpenCV face-cascade webcam locker:
+    Scans 30 frames with CLAHE contrast normalization across frontal, alt2, and profile
+    cascades (both normal and horizontally flipped for right-facing streamers).
+    Requires >=3 spatially clustered face detections in a side webcam zone so gameplay
+    never gets cropped into the top panel.
     """
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -331,89 +332,74 @@ def auto_detect_facecam_crop(video_path):
         cap.release()
         return None
 
-    cascades = []
-    if hasattr(cv2, "CascadeClassifier"):
-        cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
-        for xml_name in (
-            "haarcascade_frontalface_default.xml",
-            "haarcascade_frontalface_alt2.xml",
-            "haarcascade_profileface.xml",
-        ):
-            clf = cv2.CascadeClassifier(cascade_dir + xml_name)
-            if not clf.empty():
-                cascades.append(clf)
+    cascade_dir = cv2.data.haarcascades
+    frontal = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_default.xml")
+    alt2 = cv2.CascadeClassifier(cascade_dir + "haarcascade_frontalface_alt2.xml")
+    profile = cv2.CascadeClassifier(cascade_dir + "haarcascade_profileface.xml")
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    min_face = max(24, int(min(w, h) * 0.035))
+    max_face = int(min(w, h) * 0.25)
+    hits = []
 
-    zones = [
-        ("top-left", 0.00, 0.00, 0.24, 0.27),
-        ("mid-left", 0.00, 0.18, 0.24, 0.27),
-        ("gta-left", 0.00, 0.48, 0.23, 0.26),
-        ("bottom-left", 0.00, 0.72, 0.24, 0.27),
-        ("top-right", 0.76, 0.00, 0.24, 0.27),
-        ("bottom-right", 0.76, 0.72, 0.24, 0.27),
-    ]
-    zone_skin_scores = {z[0]: [] for z in zones}
-    face_detections = []
-
-    for i in range(1, 25):
-        frac = i / 25.0
+    for i in range(1, 31):
+        frac = i / 31.0
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * frac))
         ok, frame = cap.read()
         if not ok:
             continue
 
-        if cascades:
-            gray = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-            for det in cascades:
-                found = det.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=3, minSize=(26, 26))
+        gray = clahe.apply(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        frame_faces = []
+
+        for det in (frontal, alt2, profile):
+            if not det.empty():
+                found = det.detectMultiScale(
+                    gray, scaleFactor=1.08, minNeighbors=4,
+                    minSize=(min_face, min_face), maxSize=(max_face, max_face)
+                )
                 if len(found) > 0:
-                    for (fx, fy, fw, fh) in found:
-                        cx, cy = fx + fw / 2.0, fy + fh / 2.0
-                        if cx < w * 0.36 or cx > w * 0.64:
-                            face_detections.append((cx, cy))
+                    frame_faces.extend(found)
                     break
 
-        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-        skin_mask = cv2.inRange(ycrcb, np.array([25, 133, 77]), np.array([245, 178, 132]))
+        if not frame_faces and not profile.empty():
+            flipped = cv2.flip(gray, 1)
+            found_flip = profile.detectMultiScale(
+                flipped, scaleFactor=1.08, minNeighbors=4,
+                minSize=(min_face, min_face), maxSize=(max_face, max_face)
+            )
+            for (fx, fy, fw, fh) in found_flip:
+                frame_faces.append((w - fx - fw, fy, fw, fh))
 
-        for z_name, xf, yf, wf, hf in zones:
-            x1, y1 = int(w * xf), int(h * yf)
-            x2, y2 = int(w * (xf + wf)), int(h * (yf + hf))
-            roi_skin = float(np.mean(skin_mask[y1:y2, x1:x2] > 0))
-            zone_skin_scores[z_name].append(roi_skin)
+        for (fx, fy, fw, fh) in frame_faces:
+            cx, cy = fx + fw / 2.0, fy + fh / 2.0
+            if cx < w * 0.34 or cx > w * 0.66:
+                hits.append((cx, cy))
 
     cap.release()
 
-    if face_detections:
-        med_cx = float(np.median([d[0] for d in face_detections]))
-        med_cy = float(np.median([d[1] for d in face_detections]))
-        crop_w = int(w * 0.24)
-        crop_h = int(h * 0.26)
-        x0 = max(0, min(int(med_cx - crop_w * 0.50), w - crop_w))
-        y0 = max(0, min(int(med_cy - crop_h * 0.42), h - crop_h))
-        crop_str = f"crop={crop_w}:{crop_h}:{x0}:{y0}"
-        print(f"Auto facecam locked via OpenCV face tracking ({len(face_detections)} hits): {crop_str}")
-        return crop_str
+    if len(hits) < 3:
+        return None
 
-    best_zone = None
-    best_score = 0.0
-    for z_name, xf, yf, wf, hf in zones:
-        scores = zone_skin_scores[z_name]
-        if not scores:
-            continue
-        med_skin = float(np.median(scores))
-        if 0.06 <= med_skin <= 0.60 and med_skin > best_score:
-            best_score = med_skin
-            best_zone = (z_name, xf, yf, wf, hf)
+    med_cx = float(np.median([p[0] for p in hits]))
+    med_cy = float(np.median([p[1] for p in hits]))
+    clustered = [
+        p for p in hits
+        if abs(p[0] - med_cx) < w * 0.12 and abs(p[1] - med_cy) < h * 0.14
+    ]
+    if len(clustered) < 3:
+        return None
 
-    if best_zone:
-        z_name, xf, yf, wf, hf = best_zone
-        crop_str = f"crop=iw*{wf:.2f}:ih*{hf:.2f}:iw*{xf:.2f}:ih*{yf:.2f}"
-        print(f"Auto facecam locked via skin/overlay detector ({z_name}, score={best_score:.2f}): {crop_str}")
-        return crop_str
+    final_cx = float(np.median([p[0] for p in clustered]))
+    final_cy = float(np.median([p[1] for p in clustered]))
 
-    return None
+    crop_w = int(w * 0.24)
+    crop_h = int(h * 0.26)
+    x0 = max(0, min(int(final_cx - crop_w * 0.50), w - crop_w))
+    y0 = max(0, min(int(final_cy - crop_h * 0.42), h - crop_h))
+    crop_str = f"crop={crop_w}:{crop_h}:{x0}:{y0}"
+    print(f"Auto facecam locked ({len(clustered)}/{len(hits)} clustered face hits): {crop_str}")
+    return crop_str
 
 
 def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp4"):
@@ -430,7 +416,7 @@ def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp
 
     cam_crop = auto_detect_facecam_crop(trimmed)
     if not cam_crop:
-        print("Auto facecam detector found no webcam in this clip — skipping.")
+        print("Auto facecam detector found no confirmed webcam face — skipping clip.")
         return None, None
 
     subprocess.run(
