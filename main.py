@@ -12,11 +12,18 @@ import cloudinary
 import cloudinary.uploader
 from faster_whisper import WhisperModel
 from google import genai
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
 
 CLOUDINARY_URL = os.environ["CLOUDINARY_URL"]
 BUFFER_ACCESS_TOKEN = os.environ["BUFFER_ACCESS_TOKEN"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
+YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
+YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+YOUTUBE_REFRESH_TOKEN = os.environ.get("YOUTUBE_REFRESH_TOKEN", "")
 COOKIES_FILE = "cookies.txt"
 HISTORY_FILE = "posted_history.json"
 
@@ -43,7 +50,14 @@ GTA6_KEYWORDS = ("gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi", "gra
 UNSAFE_KEYWORDS = (
     "pegging", "porn", "nsfw", "naked", "nude", "nudity", "sex", "sexual",
     "strip club", "stripper", "onlyfans", "hentai", "blowjob", "handjob",
-    "erotic", "bdsm", "fetish", "slut", "whore", "rape", "suicide", "gore"
+    "erotic", "bdsm", "fetish", "slut", "whore", "rape", "suicide", "gore",
+    "kill yourself", "kys", "nigger", "nigga", "faggot", "retard", "cocaine",
+    "heroin", "meth", "shooting", "terrorist", "copyright strike", "dmca"
+)
+
+RISKY_MEDIA_KEYWORDS = (
+    "music video", "official audio", "reacting to", "watch party", "movie night",
+    "full album", "spotify", "concert", "lyrics", "remix", "copyright"
 )
 
 
@@ -56,7 +70,11 @@ def yt_auth_args():
 
 def is_safe_text(text):
     lowered = text.lower()
-    return not any(re.search(rf"\b{re.escape(bad)}\b", lowered) for bad in UNSAFE_KEYWORDS)
+    if any(re.search(rf"\b{re.escape(bad)}\b", lowered) for bad in UNSAFE_KEYWORDS):
+        return False
+    if any(risky in lowered for risky in RISKY_MEDIA_KEYWORDS):
+        return False
+    return True
 
 
 def is_gta6_entry(entry):
@@ -125,7 +143,7 @@ def collect_viral_candidates(streamers, history):
                     continue
 
                 if not is_safe_text(title):
-                    print(f"Skipping unsafe title for YouTube TOS: {title[:60]}")
+                    print(f"Skipping risky/unsafe title for YouTube compliance: {title[:60]}")
                     continue
 
                 is_live = (entry.get("live_status") == "is_live")
@@ -163,7 +181,7 @@ def collect_viral_candidates(streamers, history):
         key=lambda c: (c["is_gta6"], c["different_platform"], c["different_creator"], c["weighted_views"]),
         reverse=True
     )
-    print(f"Total safe unposted candidates found: {len(candidates)}")
+    print(f"Total compliant unposted candidates found: {len(candidates)}")
     return candidates
 
 
@@ -230,7 +248,7 @@ def download_candidate(candidate, raw_output="raw_stream.mp4"):
     return None
 
 
-def find_hype_window(video_path, clip_len=38):
+def find_hype_window(video_path, clip_len=36):
     wav_path = "temp_audio.wav"
     subprocess.run(
         ["ffmpeg", "-y", "-i", video_path, "-ac", "1", "-ar", "16000", wav_path],
@@ -321,13 +339,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def auto_detect_facecam_crop(video_path):
-    """
-    True OpenCV face-cascade webcam locker:
-    Scans 30 frames with CLAHE contrast normalization across frontal, alt2, and profile
-    cascades (both normal and horizontally flipped for right-facing streamers).
-    Requires >=2 spatially clustered face detections in a side webcam zone so gameplay
-    never gets cropped into the top panel.
-    """
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -429,15 +440,19 @@ def render_split_clip(raw_video, start_sec, duration, output_path="final_clip.mp
     )
     ass_file, transcript = generate_word_subtitles(clip_wav)
 
+    if len(transcript.split()) < 6:
+        print("Clip lacks sufficient spoken dialogue — skipping for reused-content safety.")
+        return None, None
+
     if not is_safe_text(transcript):
-        print("Transcript triggered YouTube safety filter — skipping clip.")
+        print("Transcript triggered YouTube compliance filter — skipping clip.")
         return None, None
 
     filter_complex = (
         f"[0:v]{cam_crop},scale=1080:660:force_original_aspect_ratio=increase,crop=1080:660,eq=contrast=1.05:saturation=1.08[cam];"
         f"[0:v]crop=ih*(1080/1260):ih:(iw-ih*(1080/1260))/2:0,scale=1080:1260[game];"
         f"[cam][game]vstack=inputs=2,setpts=0.97*PTS,ass={ass_file}[v];"
-        f"[0:a]highpass=f=180,lowpass=f=4500,atempo=1.03[a]"
+        f"[0:a]highpass=f=220,lowpass=f=3800,atempo=1.03[a]"
     )
 
     subprocess.run(
@@ -458,15 +473,18 @@ def make_viral_caption(streamer, transcript, clip_title="", is_gta6=False):
     name = streamer["name"]
     platform = streamer.get("platform", "Twitch")
     game_tag = "#gta6 " if is_gta6 else ""
-    credit_line = f"Credit: @{name} on {platform}"
+    attribution = (
+        f"Featured Creator: @{name} ({platform})\n"
+        f"Edited with split-screen framing and real-time captions for gaming highlight commentary."
+    )
 
     clean_clip_title = re.sub(r"[^\w\s'!?.,-]", "", clip_title).strip()
     if clean_clip_title and len(clean_clip_title) > 4 and is_safe_text(clean_clip_title):
         fallback_hook = f"{clean_clip_title[:65]} ({name}) {game_tag}#gaming #{name.lower()} #shorts"
     else:
-        fallback_hook = f"{name} couldn't believe what just happened {game_tag}#gaming #{name.lower()} #shorts"
+        fallback_hook = f"{name} reacts to an insane gaming moment {game_tag}#gaming #{name.lower()} #shorts"
 
-    fallback = f"{fallback_hook}\n\n{credit_line}"
+    fallback = f"{fallback_hook}\n\n{attribution}"
 
     if not GEMINI_API_KEY:
         return fallback
@@ -474,23 +492,77 @@ def make_viral_caption(streamer, transcript, clip_title="", is_gta6=False):
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = (
-            f"Write a unique, advertiser-friendly, viral 1-sentence YouTube Shorts title (under 75 chars) about this gaming clip of {name}. "
+            f"Write a unique, advertiser-friendly, 1-sentence YouTube Shorts title (under 75 chars) about this gaming highlight of {name}. "
             f"Context: '{clean_clip_title}'. Dialogue: '{transcript[:280]}'. "
-            f"Keep it completely safe for YouTube Community Guidelines (no sexual/explicit words or slurs). "
+            f"Must strictly comply with YouTube Community Guidelines (no profanity, sexual terms, violence, or slurs). "
             f"End with {game_tag}#gaming #{name.lower()} #shorts. Return ONLY the single caption line."
         )
         res = client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
         hook = res.text.strip().splitlines()[0][:125]
         if hook and is_safe_text(hook):
             print(f"Generated unique AI caption: {hook}")
-            return f"{hook}\n\n{credit_line}"
+            return f"{hook}\n\n{attribution}"
     except Exception as e:
         print(f"Gemini caption warning ({e}); using clip-title fallback.")
 
     return fallback
 
 
-def publish_to_all_platforms(public_video_url, caption):
+def upload_direct_to_youtube(video_path, caption, streamer_name, is_gta6=False):
+    if not (YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET and YOUTUBE_REFRESH_TOKEN):
+        print("YouTube OAuth secrets not set — skipping direct YouTube upload.")
+        return False
+
+    try:
+        creds = Credentials(
+            token=None,
+            refresh_token=YOUTUBE_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=YOUTUBE_CLIENT_ID,
+            client_secret=YOUTUBE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/youtube.upload"],
+        )
+        youtube = build("youtube", "v3", credentials=creds)
+
+        first_line = caption.splitlines()[0]
+        clean_title = re.sub(r"[^\w\s'!?.,-]", "", first_line.split("#")[0]).strip()[:85] or f"{streamer_name} Gaming Highlight"
+        yt_title = f"{clean_title} #shorts"[:100]
+
+        tags = ["shorts", "gaming", streamer_name.lower(), "gaming highlights", "clips"]
+        if is_gta6:
+            tags.extend(["gta6", "gta 6", "gtavi"])
+
+        body = {
+            "snippet": {
+                "title": yt_title,
+                "description": caption,
+                "tags": tags,
+                "categoryId": "20",
+            },
+            "status": {
+                "privacyStatus": "public",
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+
+        response = None
+        while response is None:
+            _, response = request.next_chunk()
+
+        print(f"Direct YouTube upload succeeded! Video ID: {response.get('id')} | Title: {yt_title}")
+        return True
+    except HttpError as e:
+        print(f"Direct YouTube API warning (HTTP {e.resp.status}): {e}")
+        return False
+    except Exception as e:
+        print(f"Direct YouTube upload warning: {e}")
+        return False
+
+
+def publish_to_social_channels(public_video_url, caption, skip_youtube=True):
     url = "https://api.buffer.com"
     headers = {
         "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
@@ -509,10 +581,13 @@ def publish_to_all_platforms(public_video_url, caption):
     """
     ch_res = requests.post(url, headers=headers, json={"query": ch_query, "variables": {"orgId": org_id}}).json()
     active_channels = [c for c in ch_res.get("data", {}).get("channels", []) if not c.get("isDisconnected")]
-    print(f"Found {len(active_channels)} active Buffer channels: {[c['service'] for c in active_channels]}")
 
+    if skip_youtube:
+        active_channels = [c for c in active_channels if c["service"].lower() != "youtube"]
+
+    print(f"Publishing via Buffer to channels: {[c['service'] for c in active_channels]}")
     if not active_channels:
-        raise RuntimeError("No active/connected Buffer channels found!")
+        return 0
 
     mutation = """
     mutation CreatePost($input: CreatePostInput!) {
@@ -534,16 +609,6 @@ def publish_to_all_platforms(public_video_url, caption):
         }
         if service == "instagram":
             post_input["metadata"] = {"instagram": {"type": "reel", "shouldShareToFeed": True}}
-        elif service == "youtube":
-            first_line = caption.splitlines()[0]
-            ascii_title = re.sub(r"[^\w\s'!?.,-]", "", first_line.split("#")[0]).strip()[:85] or "Crazy Stream Moment"
-            post_input["metadata"] = {
-                "youtube": {
-                    "title": f"{ascii_title} #shorts"[:100],
-                    "categoryId": "20",
-                    "privacy": "public"
-                }
-            }
 
         res = requests.post(url, headers=headers, json={"query": mutation, "variables": {"input": post_input}}).json()
         print(f"Buffer response for {ch['service']} ({ch['name']}):", json.dumps(res))
@@ -555,8 +620,7 @@ def publish_to_all_platforms(public_video_url, caption):
         else:
             print(f"WARNING: Failed to post to {ch['service']}: {res}")
 
-    if success_count == 0:
-        raise RuntimeError("Buffer rejected posts across all channels — check logs above.")
+    return success_count
 
 
 if __name__ == "__main__":
@@ -573,7 +637,7 @@ if __name__ == "__main__":
             continue
 
         streamer = candidate["streamer"]
-        start_s, clip_dur = find_hype_window(raw_file, clip_len=38)
+        start_s, clip_dur = find_hype_window(raw_file, clip_len=36)
         final_clip, transcript = render_split_clip(raw_file, start_s, clip_dur)
         if not final_clip:
             history["posted_ids"].append(candidate["id"])
@@ -587,9 +651,18 @@ if __name__ == "__main__":
             is_gta6=candidate["is_gta6"]
         )
 
+        yt_ok = upload_direct_to_youtube(
+            final_clip,
+            caption,
+            streamer_name=streamer["name"],
+            is_gta6=candidate["is_gta6"]
+        )
+
         upload = cloudinary.uploader.upload(final_clip, resource_type="video")
         try:
-            publish_to_all_platforms(upload["secure_url"], caption)
+            buffer_ok = publish_to_social_channels(upload["secure_url"], caption, skip_youtube=True)
+            if not yt_ok and buffer_ok == 0:
+                raise RuntimeError("Both YouTube direct upload and Buffer uploads failed.")
             history["posted_ids"].append(candidate["id"])
             history["last_streamer"] = streamer["name"]
             history["last_platform"] = streamer["platform"]
