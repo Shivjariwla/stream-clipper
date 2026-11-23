@@ -20,7 +20,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg nodejs
 
       - run: |
-          pip install -U "yt-dlp[default]" faster-whisper numpy requests cloudinary google-genai
+          pip install -U "yt-dlp[default]" faster-whisper numpy requests cloudinary google-genai google-api-python-client google-auth-oauthlib
           pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless || true
           pip install --no-cache-dir "opencv-contrib-python-headless<5"
 
@@ -30,6 +30,9 @@ jobs:
           BUFFER_ACCESS_TOKEN: ${{ secrets.BUFFER_ACCESS_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
         run: python main.py
 
       - name: Save posted clip history
