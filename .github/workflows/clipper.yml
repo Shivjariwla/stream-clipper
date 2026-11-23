@@ -2,7 +2,7 @@ name: Auto Stream Clipper
 
 on:
   schedule:
-    - cron: '0 0,2,5,7,10,12,15,17,20,22 * * *'
+    - cron: '17 1,5,9,13,17,21 * * *'
   workflow_dispatch:
 
 jobs:
@@ -22,7 +22,7 @@ jobs:
       - run: |
           pip install -U "yt-dlp[default]" faster-whisper numpy requests cloudinary google-genai
           pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless || true
-          pip install --no-cache-dir opencv-python-headless
+          pip install --no-cache-dir "opencv-contrib-python-headless<5"
 
       - name: Run clipper
         env:
