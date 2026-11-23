@@ -2,7 +2,7 @@ name: Auto Stream Clipper
 
 on:
   schedule:
-    - cron: '17 1,5,9,13,17,21 * * *'
+    - cron: '17 */2 * * *'
   workflow_dispatch:
 
 jobs:
