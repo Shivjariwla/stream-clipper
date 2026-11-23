@@ -30,6 +30,10 @@ STREAMERS = [
     {"name": "KaiCenat", "platform": "Twitch", "url": "https://www.twitch.tv/kaicenat/clips?filter=clips&range=24hr"},
     {"name": "xQc", "platform": "Twitch", "url": "https://www.twitch.tv/xqc/clips?filter=clips&range=24hr"},
     {"name": "CaseOh", "platform": "Twitch", "url": "https://www.twitch.tv/caseoh_/clips?filter=clips&range=24hr"},
+    {"name": "Jynxzi", "platform": "Twitch", "url": "https://www.twitch.tv/jynxzi/clips?filter=clips&range=24hr"},
+    {"name": "PlaqueBoyMax", "platform": "Twitch", "url": "https://www.twitch.tv/plaqueboymax/clips?filter=clips&range=24hr"},
+    {"name": "Agent00", "platform": "Twitch", "url": "https://www.twitch.tv/agent00/clips?filter=clips&range=24hr"},
+    {"name": "Lacy", "platform": "Twitch", "url": "https://www.twitch.tv/lacy/clips?filter=clips&range=24hr"},
     {"name": "IShowSpeed", "platform": "YouTube", "url": "https://www.youtube.com/@IShowSpeed/streams"},
     {"name": "IShowSpeed", "platform": "YouTube", "url": "ytsearch8:IShowSpeed live stream clip"},
 ]
@@ -321,7 +325,7 @@ def auto_detect_facecam_crop(video_path):
     True OpenCV face-cascade webcam locker:
     Scans 30 frames with CLAHE contrast normalization across frontal, alt2, and profile
     cascades (both normal and horizontally flipped for right-facing streamers).
-    Requires >=3 spatially clustered face detections in a side webcam zone so gameplay
+    Requires >=2 spatially clustered face detections in a side webcam zone so gameplay
     never gets cropped into the top panel.
     """
     cap = cv2.VideoCapture(video_path)
@@ -355,7 +359,7 @@ def auto_detect_facecam_crop(video_path):
         for det in (frontal, alt2, profile):
             if not det.empty():
                 found = det.detectMultiScale(
-                    gray, scaleFactor=1.08, minNeighbors=4,
+                    gray, scaleFactor=1.08, minNeighbors=3,
                     minSize=(min_face, min_face), maxSize=(max_face, max_face)
                 )
                 if len(found) > 0:
@@ -365,7 +369,7 @@ def auto_detect_facecam_crop(video_path):
         if not frame_faces and not profile.empty():
             flipped = cv2.flip(gray, 1)
             found_flip = profile.detectMultiScale(
-                flipped, scaleFactor=1.08, minNeighbors=4,
+                flipped, scaleFactor=1.08, minNeighbors=3,
                 minSize=(min_face, min_face), maxSize=(max_face, max_face)
             )
             for (fx, fy, fw, fh) in found_flip:
@@ -378,16 +382,16 @@ def auto_detect_facecam_crop(video_path):
 
     cap.release()
 
-    if len(hits) < 3:
+    if len(hits) < 2:
         return None
 
     med_cx = float(np.median([p[0] for p in hits]))
     med_cy = float(np.median([p[1] for p in hits]))
     clustered = [
         p for p in hits
-        if abs(p[0] - med_cx) < w * 0.12 and abs(p[1] - med_cy) < h * 0.14
+        if abs(p[0] - med_cx) < w * 0.16 and abs(p[1] - med_cy) < h * 0.18
     ]
-    if len(clustered) < 3:
+    if len(clustered) < 2:
         return None
 
     final_cx = float(np.median([p[0] for p in clustered]))
