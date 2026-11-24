@@ -2,7 +2,7 @@ name: Auto Stream Clipper
 
 on:
   schedule:
-    # Runs 4x daily at peak EST hours (8:23 AM, 1:23 PM, 6:23 PM, 10:23 PM EST)
+    # Backup schedule (runs 4x daily at 8:23 AM, 1:23 PM, 6:23 PM, 10:23 PM EST)
     - cron: '23 13,18,23,3 * * *'
   workflow_dispatch:
 
